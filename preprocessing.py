@@ -27,7 +27,12 @@ nltk.download('stopwords')
 nltk.download('wordnet')
 
 # Створення списку українських стоп-слів
-stop_words = set(stopwords.words('ukrainian'))
+try:
+    stop_words = set(stopwords.words('ukrainian'))
+except OSError:
+    # Если стоп-слова недоступны, используем наш собственный список
+    from ukrainian_stopwords import UKRAINIAN_STOPWORDS
+    stop_words = set(UKRAINIAN_STOPWORDS)
 
 def normalize_text(text):
     """
