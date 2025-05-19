@@ -2,7 +2,12 @@
 main.py
 Основний файл для класифікації емоцій у тексті за допомогою LSTM та BERT-lite
 """
+import os
+import warnings
 
+# Подавление предупреждений TensorFlow/CUDA
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Подавляет все сообщения TensorFlow
+warnings.filterwarnings('ignore')  # Подавляет прочие предупреждения Python
 import torch
 import torch.nn as nn
 import torch.optim as optim
