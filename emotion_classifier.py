@@ -1,204 +1,464 @@
-"""
-emotion_classifier.py
-Модуль для класифікації емоцій у тексті
-"""
-
 import torch
-from transformers import BertTokenizer
-import os
-import json
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
+from preprocessing import preprocess_text
 
-# Імпортуємо наші модулі
-from lstm_model import LSTMModel, preprocess_for_lstm
-from bert_lite_model import BERTLiteModel, preprocess_for_bert
-
-class EmotionClassifier:
+def predict_emotion(text, model, vocab=None, tokenizer=None, label_mapping=None, device='cpu', model_type='lstm'):
     """
-    Клас для класифікації емоцій у тексті
-    """
-    def __init__(self, model_type, model_path, config_path, device='cuda'):
-        """
-        Ініціалізація класифікатора
-        
-        Args:
-            model_type: Тип моделі ('lstm' або 'bert')
-            model_path: Шлях до ваг моделі
-            config_path: Шлях до конфігурації моделі
-            device: Пристрій для обчислень
-        """
-        self.model_type = model_type
-        self.device = device
-        
-        # Завантаження конфігурації
-        with open(config_path, 'r') as f:
-            self.config = json.load(f)
-        
-        # Ініціалізація моделі в залежності від типу
-        if model_type == 'lstm':
-            self.model = self._init_lstm_model()
-            # Підготовка препроцесору
-            self.preprocess = lambda text: preprocess_for_lstm(text, self.config['word2idx'])
-        elif model_type == 'bert':
-            self.model = self._init_bert_model()
-            # Ініціалізація токенізатора BERT
-            self.tokenizer = BertTokenizer.from_pretrained(self.config['tokenizer'])
-            self.preprocess = lambda text: preprocess_for_bert(text, self.tokenizer)
-        else:
-            raise ValueError(f"Непідтримуваний тип моделі: {model_type}")
-        
-        # Завантаження ваг моделі
-        self.model.load_state_dict(torch.load(model_path, map_location=device))
-        self.model = self.model.to(device)
-        self.model.eval()
-        
-        # Словник міток
-        self.idx2label = self.config['idx2label']
-        if isinstance(self.idx2label, dict):
-            # Конвертуємо ключі з рядків у числа (для JSON)
-            self.idx2label = {int(k): v for k, v in self.idx2label.items()}
-    
-    def _init_lstm_model(self):
-        """
-        Ініціалізація LSTM моделі
-        
-        Returns:
-            LSTM модель
-        """
-        model = LSTMModel(
-            vocab_size=self.config['vocab_size'],
-            embedding_dim=self.config['embedding_dim'],
-            hidden_dim=self.config['hidden_dim'],
-            output_dim=self.config['output_dim'],
-            n_layers=self.config['n_layers'],
-            bidirectional=self.config['bidirectional'],
-            dropout=self.config['dropout'],
-            pad_idx=self.config['pad_idx']
-        )
-        return model
-    
-    def _init_bert_model(self):
-        """
-        Ініціалізація BERT-lite моделі
-        
-        Returns:
-            BERT-lite модель
-        """
-        model = BERTLiteModel(
-            num_classes=self.config['num_classes'],
-            hidden_size=self.config['hidden_size'],
-            num_hidden_layers=self.config['num_hidden_layers'],
-            num_attention_heads=self.config['num_attention_heads'],
-            intermediate_size=self.config['intermediate_size'],
-            dropout=self.config['dropout']
-        )
-        return model
-    
-    def predict(self, text):
-        """
-        Передбачення емоції для тексту
-        
-        Args:
-            text: Вхідний текст
-            
-        Returns:
-            Кортеж з передбаченою емоцією, ймовірністю та всіма ймовірностями
-        """
-        # Препроцесинг тексту
-        inputs = self.preprocess(text)
-        
-        # Переміщення входів на пристрій
-        inputs = [tensor.to(self.device) for tensor in inputs]
-        
-        # Передбачення
-        with torch.no_grad():
-            if self.model_type == 'lstm':
-                outputs = self.model(inputs[0], inputs[1])
-            else:  # bert
-                outputs = self.model(inputs[0], inputs[1])
-        
-        # Отримання ймовірностей
-        probabilities = torch.softmax(outputs, dim=1)[0]
-        
-        # Отримання індексу найбільш ймовірного класу
-        predicted_idx = probabilities.argmax().item()
-        
-        # Отримання емоції та ймовірності
-        emotion = self.idx2label[predicted_idx]
-        probability = probabilities[predicted_idx].item()
-        
-        return emotion, probability, probabilities.cpu().numpy()
-    
-    def get_all_emotions(self):
-        """
-        Отримання списку всіх емоцій
-        
-        Returns:
-            Список емоцій
-        """
-        return list(set(self.idx2label.values()))
-
-def load_emotion_classifier(model_type, models_dir='models', device='cuda'):
-    """
-    Завантаження класифікатора емоцій
+    Предсказание эмоции для текста
     
     Args:
-        model_type: Тип моделі ('lstm' або 'bert')
-        models_dir: Директорія з моделями
-        device: Пристрій для обчислень
+        text: текст для классификации
+        model: модель (LSTM или BERT-lite)
+        vocab: словарь для LSTM (опционально)
+        tokenizer: токенизатор для BERT (опционально)
+        label_mapping: соответствие меток и классов
+        device: устройство (cpu или cuda)
+        model_type: тип модели ('lstm' или 'bert')
         
     Returns:
-        Класифікатор емоцій
+        predicted_emotion: предсказанная эмоция
+        probability: вероятность предсказания
     """
+    # Инвертирование label_mapping для получения названий эмоций
+    id_to_label = {v: k for k, v in label_mapping.items()}
+    
+    # Переводим модель в режим оценки
+    model.eval()
+    
+    # Предобработка текста
+    preprocessed_text = preprocess_text(text)
+    
+    # Предобработка текста в зависимости от типа модели
     if model_type == 'lstm':
-        model_path = os.path.join(models_dir, 'lstm_emotion_model.pt')
-        config_path = os.path.join(models_dir, 'lstm_emotion_config.json')
-    elif model_type == 'bert':
-        model_path = os.path.join(models_dir, 'bert_emotion_model.pt')
-        config_path = os.path.join(models_dir, 'bert_emotion_config.json')
-    else:
-        raise ValueError(f"Непідтримуваний тип моделі: {model_type}")
+        if vocab is None:
+            raise ValueError("vocab must be provided for LSTM model")
+        
+        # Токенизация и преобразование в индексы
+        tokens = preprocessed_text.split()
+        indexes = [vocab.get(token, vocab["<UNK>"]) for token in tokens]
+        
+        # Ограничение длины
+        max_len = 128
+        if len(indexes) > max_len:
+            indexes = indexes[:max_len]
+        
+        # Создание тензора и переход на устройство
+        text_tensor = torch.tensor(indexes, dtype=torch.long).unsqueeze(0).to(device)
+        text_length = torch.tensor([len(indexes)], dtype=torch.long).to(device)
+        
+        # Предсказание
+        with torch.no_grad():
+            predictions = model(text_tensor, text_length)
+    else:  # bert
+        if tokenizer is None:
+            raise ValueError("tokenizer must be provided for BERT model")
+        
+        # Токенизация с помощью BERT-токенизатора
+        encoding = tokenizer.encode_plus(
+            preprocessed_text,
+            add_special_tokens=True,
+            max_length=128,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt'
+        )
+        
+        # Переход на устройство
+        input_ids = encoding['input_ids'].to(device)
+        attention_mask = encoding['attention_mask'].to(device)
+        
+        # Предсказание
+        with torch.no_grad():
+            predictions = model(input_ids, attention_mask)
     
-    if not os.path.exists(model_path) or not os.path.exists(config_path):
-        raise FileNotFoundError(f"Модель {model_type} не знайдена в директорії {models_dir}")
+    # Получение предсказанного класса и вероятности
+    probabilities = F.softmax(predictions, dim=1)
+    predicted_idx = torch.argmax(predictions, dim=1).item()
+    probability = probabilities[0][predicted_idx].item()
     
-    return EmotionClassifier(model_type, model_path, config_path, device)
+    # Получение названия эмоции
+    predicted_emotion = id_to_label[predicted_idx]
+    
+    return predicted_emotion, probability
+
+def visualize_attention(text, model, tokenizer, device='cpu'):
+    """
+    Визуализация внимания BERT-модели
+    
+    Args:
+        text: текст для визуализации
+        model: BERT-модель
+        tokenizer: токенизатор BERT
+        device: устройство (cpu или cuda)
+    """
+    # Токенизация текста
+    encoding = tokenizer.encode_plus(
+        text,
+        add_special_tokens=True,
+        max_length=128,
+        padding='max_length',
+        truncation=True,
+        return_attention_mask=True,
+        return_tensors='pt'
+    )
+    
+    # Переход на устройство
+    input_ids = encoding['input_ids'].to(device)
+    attention_mask = encoding['attention_mask'].to(device)
+    
+    # Получение выходов BERT-модели
+    model.eval()
+    with torch.no_grad():
+        outputs = model.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_attentions=True
+        )
+    
+    # Получение матрицы внимания
+    attentions = outputs.attentions  # Размер: (batch_size, num_heads, seq_len, seq_len)
+    
+    # Преобразование индексов в токены
+    tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
+    
+    # Удаление паддинга из списка токенов
+    actual_tokens = []
+    for token, mask in zip(tokens, attention_mask[0]):
+        if mask:
+            actual_tokens.append(token)
+        else:
+            break
+    
+    # Выбор слоя и головки внимания для визуализации
+    layer_idx = -1  # Последний слой
+    head_idx = 0    # Первая головка
+    
+    # Получение матрицы внимания для выбранного слоя и головки
+    attention_matrix = attentions[layer_idx][0, head_idx].cpu().numpy()
+    
+    # Обрезка матрицы внимания до фактической длины последовательности
+    attention_matrix = attention_matrix[:len(actual_tokens), :len(actual_tokens)]
+    
+    # Визуализация
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(attention_matrix, annot=False, cmap='viridis', xticklabels=actual_tokens, yticklabels=actual_tokens)
+    plt.title(f'BERT Attention - Layer {layer_idx+1}, Head {head_idx+1}')
+    plt.xlabel('Token (Key)')
+    plt.ylabel('Token (Query)')
+    plt.tight_layout()
+    plt.show()
+
+def analyze_errors(model, test_loader, criterion, device, class_names, model_type='lstm'):
+    """
+    Анализ ошибок модели
+    
+    Args:
+        model: модель (LSTM или BERT-lite)
+        test_loader: даталоадер с тестовыми данными
+        criterion: функция потерь
+        device: устройство (cpu или cuda)
+        class_names: названия классов
+        model_type: тип модели ('lstm' или 'bert')
+        
+    Returns:
+        error_samples: примеры с ошибками
+        conf_matrix: матрица ошибок
+    """
+    # Переводим модель в режим оценки
+    model.eval()
+    
+    all_preds = []
+    all_labels = []
+    error_samples = []
+    
+    # Отключение вычисления градиентов для ускорения оценки
+    with torch.no_grad():
+        for batch in test_loader:
+            # Извлечение данных из батча в зависимости от типа модели
+            if model_type == 'lstm':
+                text = batch['text'].to(device)
+                text_lengths = batch['length'].to(device)
+                labels = batch['label'].to(device)
+                
+                # Прямой проход
+                predictions = model(text, text_lengths)
+            else:  # bert
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                labels = batch['label'].to(device)
+                
+                # Прямой проход
+                predictions = model(input_ids, attention_mask)
+            
+            # Получение предсказанных классов
+            preds = torch.argmax(predictions, dim=1)
+            
+            # Сохранение предсказаний и истинных меток
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            
+            # Поиск ошибок
+            errors = preds != labels
+            error_indices = torch.nonzero(errors).squeeze(-1)
+            
+            # Сохранение примеров с ошибками
+            for idx in error_indices:
+                idx = idx.item()
+                if model_type == 'lstm':
+                    error_samples.append({
+                        'text_idx': batch['text'][idx].cpu().numpy(),
+                        'true_label': labels[idx].item(),
+                        'pred_label': preds[idx].item()
+                    })
+                else:  # bert
+                    error_samples.append({
+                        'input_ids': batch['input_ids'][idx].cpu().numpy(),
+                        'true_label': labels[idx].item(),
+                        'pred_label': preds[idx].item()
+                    })
+    
+    # Вычисление матрицы ошибок
+    conf_matrix = confusion_matrix(all_labels, all_preds)
+    
+    # Визуализация матрицы ошибок
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=class_names, yticklabels=class_names)
+    plt.title('Confusion Matrix')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.tight_layout()
+    plt.show()
+    
+    return error_samples, conf_matrix
+
+def classify_text_batch(texts, model, vocab=None, tokenizer=None, label_mapping=None, device='cpu', model_type='lstm'):
+    """
+    Классификация пакета текстов
+    
+    Args:
+        texts: список текстов для классификации
+        model: модель (LSTM или BERT-lite)
+        vocab: словарь для LSTM (опционально)
+        tokenizer: токенизатор для BERT (опционально)
+        label_mapping: соответствие меток и классов
+        device: устройство (cpu или cuda)
+        model_type: тип модели ('lstm' или 'bert')
+        
+    Returns:
+        results: список кортежей (предсказанная эмоция, вероятность) для каждого текста
+    """
+    # Инвертирование label_mapping для получения названий эмоций
+    id_to_label = {v: k for k, v in label_mapping.items()}
+    
+    # Переводим модель в режим оценки
+    model.eval()
+    
+    # Предобработка текстов
+    preprocessed_texts = [preprocess_text(text) for text in texts]
+    
+    # Предобработка текста в зависимости от типа модели
+    if model_type == 'lstm':
+        if vocab is None:
+            raise ValueError("vocab must be provided for LSTM model")
+        
+        # Токенизация и преобразование в индексы
+        indexed_texts = []
+        lengths = []
+        
+        for text in preprocessed_texts:
+            tokens = text.split()
+            indexes = [vocab.get(token, vocab["<UNK>"]) for token in tokens]
+            
+            # Ограничение длины
+            max_len = 128
+            if len(indexes) > max_len:
+                indexes = indexes[:max_len]
+            
+            # Дополнение до максимальной длины
+            padding_length = max_len - len(indexes)
+            if padding_length > 0:
+                indexes = indexes + [vocab["<PAD>"]] * padding_length
+            
+            indexed_texts.append(indexes)
+            lengths.append(min(len(tokens), max_len))
+        
+        # Создание тензора и переход на устройство
+        text_tensor = torch.tensor(indexed_texts, dtype=torch.long).to(device)
+        text_lengths = torch.tensor(lengths, dtype=torch.long).to(device)
+        
+        # Предсказание
+        with torch.no_grad():
+            predictions = model(text_tensor, text_lengths)
+    else:  # bert
+        if tokenizer is None:
+            raise ValueError("tokenizer must be provided for BERT model")
+        
+        # Токенизация с помощью BERT-токенизатора
+        encodings = tokenizer.batch_encode_plus(
+            preprocessed_texts,
+            add_special_tokens=True,
+            max_length=128,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt'
+        )
+        
+        # Переход на устройство
+        input_ids = encodings['input_ids'].to(device)
+        attention_mask = encodings['attention_mask'].to(device)
+        
+        # Предсказание
+        with torch.no_grad():
+            predictions = model(input_ids, attention_mask)
+    
+    # Получение предсказанных классов и вероятностей
+    probabilities = F.softmax(predictions, dim=1)
+    predicted_indices = torch.argmax(predictions, dim=1).cpu().numpy()
+    
+    # Формирование результатов
+    results = []
+    for i, idx in enumerate(predicted_indices):
+        emotion = id_to_label[idx]
+        probability = probabilities[i, idx].item()
+        results.append((emotion, probability))
+    
+    return results
+
+def save_model(model, vocab=None, tokenizer=None, label_mapping=None, model_type='lstm', save_path='emotion_classifier_model'):
+    """
+    Сохранение модели и дополнительных данных
+    
+    Args:
+        model: модель (LSTM или BERT-lite)
+        vocab: словарь для LSTM (опционально)
+        tokenizer: токенизатор для BERT (опционально)
+        label_mapping: соответствие меток и классов
+        model_type: тип модели ('lstm' или 'bert')
+        save_path: путь для сохранения модели
+    """
+    # Создание словаря с данными для сохранения
+    save_data = {
+        'model_state': model.state_dict(),
+        'label_mapping': label_mapping,
+        'model_type': model_type
+    }
+    
+    # Добавление vocab или tokenizer в зависимости от типа модели
+    if model_type == 'lstm' and vocab is not None:
+        save_data['vocab'] = vocab
+    elif model_type == 'bert' and tokenizer is not None:
+        save_data['tokenizer'] = tokenizer
+    
+    # Сохранение данных
+    torch.save(save_data, save_path)
+    print(f"Model saved to {save_path}")
+
+def load_model(load_path, device='cpu'):
+    """
+    Загрузка модели и дополнительных данных
+    
+    Args:
+        load_path: путь для загрузки модели
+        device: устройство (cpu или cuda)
+        
+    Returns:
+        model: загруженная модель
+        vocab: словарь для LSTM (может быть None)
+        tokenizer: токенизатор для BERT (может быть None)
+        label_mapping: соответствие меток и классов
+        model_type: тип модели ('lstm' или 'bert')
+    """
+    # Загрузка данных
+    save_data = torch.load(load_path, map_location=device)
+    
+    # Извлечение данных
+    model_state = save_data['model_state']
+    label_mapping = save_data['label_mapping']
+    model_type = save_data['model_type']
+    
+    # Создание модели в зависимости от типа
+    if model_type == 'lstm':
+        from lstm_model import create_lstm_model
+        
+        # Извлечение словаря
+        vocab = save_data.get('vocab', None)
+        if vocab is None:
+            raise ValueError("vocab not found in saved data")
+        
+        # Создание модели
+        model = create_lstm_model(
+            vocab_size=len(vocab),
+            embedding_dim=300,
+            hidden_dim=256,
+            output_dim=len(label_mapping),
+            n_layers=2,
+            bidirectional=True,
+            dropout=0.3,
+            pad_idx=vocab["<PAD>"]
+        )
+        
+        # Загрузка весов
+        model.load_state_dict(model_state)
+        model = model.to(device)
+        
+        return model, vocab, None, label_mapping, model_type
+    else:  # bert
+        from bert_lite_model import create_bert_lite_model
+        from transformers import BertTokenizer
+        
+        # Извлечение токенизатора
+        tokenizer = save_data.get('tokenizer', None)
+        if tokenizer is None:
+            # Если токенизатор не сохранен, загружаем стандартный
+            tokenizer = BertTokenizer.from_pretrained("bert-base-multilingual-cased")
+        
+        # Создание модели
+        model = create_bert_lite_model(
+            num_classes=len(label_mapping),
+            hidden_size=512,
+            num_hidden_layers=6,
+            num_attention_heads=8,
+            intermediate_size=2048,
+            dropout=0.3
+        )
+        
+        # Загрузка весов
+        model.load_state_dict(model_state)
+        model = model.to(device)
+        
+        return model, None, tokenizer, label_mapping, model_type
 
 if __name__ == "__main__":
-    # Приклад використання
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Пример использования
+    # Эти примеры предполагают, что модель, словарь/токенизатор и label_mapping уже загружены
     
-    # Завантаження моделей
-    try:
-        lstm_classifier = load_emotion_classifier('lstm', device=device)
-        print("LSTM модель завантажено успішно")
-    except FileNotFoundError:
-        print("LSTM модель не знайдена")
-        lstm_classifier = None
+    # Пример текста для классификации
+    sample_text = "Я дуже щаслива сьогодні!"
     
-    try:
-        bert_classifier = load_emotion_classifier('bert', device=device)
-        print("BERT-lite модель завантажено успішно")
-    except FileNotFoundError:
-        print("BERT-lite модель не знайдена")
-        bert_classifier = None
+    # Классификация текста с помощью LSTM
+    # emotion, probability = predict_emotion(sample_text, lstm_model, vocab=vocab, label_mapping=label_mapping, model_type='lstm')
+    # print(f"LSTM: {emotion} (Вероятность: {probability:.4f})")
     
-    # Приклади текстів для класифікації
-    texts = [
-        "Я дуже рада, що ми нарешті зустрілися!",
-        "Мені так сумно через цю новину...",
-        "Я просто в шоці, не можу повірити, що це сталося!",
-        "Ненавиджу цю роботу, вона мене дратує!",
-        "Мені так страшно, що буде далі..."
-    ]
+    # Классификация текста с помощью BERT-lite
+    # emotion, probability = predict_emotion(sample_text, bert_model, tokenizer=tokenizer, label_mapping=label_mapping, model_type='bert')
+    # print(f"BERT-lite: {emotion} (Вероятность: {probability:.4f})")
     
-    # Класифікація текстів
-    for text in texts:
-        print(f"\nТекст: {text}")
-        
-        if lstm_classifier:
-            emotion, prob, _ = lstm_classifier.predict(text)
-            print(f"LSTM: {emotion} (ймовірність: {prob:.4f})")
-        
-        if bert_classifier:
-            emotion, prob, _ = bert_classifier.predict(text)
-            print(f"BERT-lite: {emotion} (ймовірність: {prob:.4f})")
+    # Визуализация внимания BERT
+    # visualize_attention(sample_text, bert_model, tokenizer)
+    
+    # Классификация пакета текстов
+    # sample_texts = ["Я дуже щаслива сьогодні!", "Мені дуже сумно.", "Я розлючений!"]
+    # results = classify_text_batch(sample_texts, bert_model, tokenizer=tokenizer, label_mapping=label_mapping, model_type='bert')
+    # for text, (emotion, probability) in zip(sample_texts, results):
+    #     print(f"Текст: {text}")
+    #     print(f"Эмоция: {emotion} (Вероятность: {probability:.4f})")
+    #     print()
