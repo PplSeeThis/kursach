@@ -1,526 +1,422 @@
-"""
-evaluation.py
-Модуль для оцінки та візуалізації результатів моделей класифікації емоцій
-"""
+#!/usr/bin/env python
+# coding: utf-8
 
-import torch
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import numpy as np
-import time
-import os
-import json
+from sklearn.metrics import confusion_matrix, f1_score, classification_report
+import torch
+from tqdm import tqdm
 
-def evaluate_model_detailed(model, dataloader, idx2label, device, model_type='lstm'):
+# Импорт наших моделей и функций для обработки данных
+from lstm_model import LSTMClassifier
+from bert_lite_model import BERTLiteClassifier
+from preprocessing import load_data, create_data_iterators
+from bert_data_preparation import create_bert_dataloaders
+
+# Настройка стилей для графиков
+plt.style.use('ggplot')
+sns.set(font_scale=1.2)
+sns.set_style("whitegrid")
+
+# Функция для создания и сохранения матрицы ошибок
+def create_confusion_matrix(y_true, y_pred, class_names, model_name, normalize=True):
     """
-    Детальна оцінка моделі на вказаному датасеті
+    Создает и сохраняет матрицу ошибок.
     
     Args:
-        model: Модель (LSTM або BERT-lite)
-        dataloader: Даталоадер з даними
-        idx2label: Словник відображення індексів у мітки
-        device: Пристрій для обчислень
-        model_type: Тип моделі ('lstm' або 'bert')
+        y_true: Истинные метки
+        y_pred: Предсказанные метки
+        class_names: Имена классов
+        model_name: Название модели для добавления в имя файла
+        normalize: Нормализовать матрицу (True) или нет (False)
         
     Returns:
-        Словник з детальними метриками
+        np.ndarray: Матрица ошибок
     """
-    # Перехід у режим оцінки
-    model.eval()
-    
-    # Збереження всіх прогнозів та міток
-    all_preds = []
-    all_labels = []
-    inference_times = []
-    
-    # Вимкнення градієнтів
-    with torch.no_grad():
-        for batch in dataloader:
-            if model_type == 'lstm':
-                # Розпакування даних для LSTM
-                texts, lengths, labels = batch
-                texts = texts.to(device)
-                lengths = lengths.to(device)
-                
-                # Вимірювання часу інференсу
-                start_time = time.time()
-                outputs = model(texts, lengths)
-                end_time = time.time()
-            else:  # model_type == 'bert'
-                # Розпакування даних для BERT
-                input_ids, attention_mask, labels = batch
-                input_ids = input_ids.to(device)
-                attention_mask = attention_mask.to(device)
-                
-                # Вимірювання часу інференсу
-                start_time = time.time()
-                outputs = model(input_ids, attention_mask)
-                end_time = time.time()
-            
-            # Обчислення часу інференсу на зразок
-            batch_size = labels.size(0)
-            inference_time = (end_time - start_time) / batch_size
-            inference_times.append(inference_time)
-            
-            # Отримання прогнозів
-            _, predicted = torch.max(outputs, 1)
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-    
-    # Конвертація індексів у назви класів для звіту
-    label_names = [idx2label[idx] for idx in range(len(idx2label))]
-    
-    # Обчислення метрик
-    accuracy = accuracy_score(all_labels, all_preds)
-    report = classification_report(all_labels, all_preds, target_names=label_names, output_dict=True)
-    
-    # Обчислення середнього часу інференсу
-    avg_inference_time = np.mean(inference_times) * 1000  # конвертація в мс
-    
-    # Повернення детальних метрик
-    return {
-        'accuracy': accuracy,
-        'precision': report['weighted avg']['precision'],
-        'recall': report['weighted avg']['recall'],
-        'f1': report['weighted avg']['f1-score'],
-        'f1_per_class': {label_names[i]: report[label]['f1-score'] for i, label in enumerate(label_names)},
-        'confusion_matrix': confusion_matrix(all_labels, all_preds),
-        'classification_report': report,
-        'y_true': all_labels,
-        'y_pred': all_preds,
-        'inference_time': avg_inference_time  # в мс
-    }
-
-def plot_training_history(history, title='Історія навчання'):
-    """
-    Візуалізація процесу навчання
-    
-    Args:
-        history: Словник з історією навчання
-        title: Заголовок графіка
-    """
-    plt.figure(figsize=(15, 5))
-    
-    # Графік втрат
-    plt.subplot(1, 2, 1)
-    plt.plot(history['train_losses'], label='Train')
-    plt.plot(history['val_losses'], label='Validation')
-    plt.title('Втрати')
-    plt.xlabel('Епоха')
-    plt.ylabel('Втрата')
-    plt.legend()
-    plt.grid(True)
-    
-    # Графік F1-міри
-    plt.subplot(1, 2, 2)
-    plt.plot(history['train_f1s'], label='Train')
-    plt.plot(history['val_f1s'], label='Validation')
-    plt.title('F1-міра')
-    plt.xlabel('Епоха')
-    plt.ylabel('F1')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.suptitle(title)
-    plt.tight_layout()
-    plt.savefig(f'{title.lower().replace(" ", "_")}.png')
-    plt.show()
-
-def plot_confusion_matrix(y_true, y_pred, class_names, title='Матриця помилок'):
-    """
-    Візуалізація матриці помилок
-    
-    Args:
-        y_true: Справжні мітки
-        y_pred: Передбачені мітки
-        class_names: Назви класів
-        title: Заголовок графіка
-    """
-    # Обчислення матриці помилок
+    # Создаем матрицу ошибок
     cm = confusion_matrix(y_true, y_pred)
     
-    # Нормалізація
-    cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+    # Нормализуем матрицу, если требуется
+    if normalize:
+        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
     
-    # Візуалізація
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(cm_norm, annot=True, fmt='.2f', cmap='Blues', 
-                xticklabels=class_names, yticklabels=class_names)
-    plt.title(title)
-    plt.xlabel('Передбачені мітки')
-    plt.ylabel('Справжні мітки')
+    # Создаем heatmap
+    plt.figure(figsize=(14, 12))
+    sns.heatmap(cm, annot=True, fmt='.2f' if normalize else 'd',
+                cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+    plt.ylabel('Истинный класс')
+    plt.xlabel('Предсказанный класс')
+    plt.title(f'Матрица ошибок для модели {model_name}')
+    
+    # Сохраняем изображение
     plt.tight_layout()
-    plt.savefig(f'{title.lower().replace(" ", "_")}.png')
-    plt.show()
+    filename = f"{model_name.lower().replace('-', '_')}_confusion_matrix.png"
+    plt.savefig(filename, dpi=300)
+    plt.close()
     
-    # Повернення матриць для подальшого аналізу
-    return cm, cm_norm
+    print(f"Матрица ошибок сохранена в файл {filename}")
+    
+    return cm
 
-def plot_f1_per_class(y_true, y_pred, class_names, title='F1-міра за класами'):
+# Функция для оценки LSTM модели
+def evaluate_lstm_model(model_path, test_data, device='cuda' if torch.cuda.is_available() else 'cpu'):
     """
-    Візуалізація F1-міри для кожного класу
+    Оценивает LSTM модель на тестовых данных и создает матрицу ошибок.
     
     Args:
-        y_true: Справжні мітки
-        y_pred: Передбачені мітки
-        class_names: Назви класів
-        title: Заголовок графіка
-    """
-    # Обчислення F1-міри для кожного класу
-    f1_per_class = f1_score(y_true, y_pred, average=None)
-    
-    # Візуалізація
-    plt.figure(figsize=(12, 6))
-    plt.bar(class_names, f1_per_class)
-    plt.title(title)
-    plt.xlabel('Клас')
-    plt.ylabel('F1-міра')
-    plt.ylim(0, 1)
-    plt.grid(axis='y')
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.savefig(f'{title.lower().replace(" ", "_")}.png')
-    plt.show()
-    
-    # Повернення значень для подальшого аналізу
-    return f1_per_class
-
-def plot_models_comparison(lstm_metrics, bert_metrics, metric_name, class_names=None, title=None):
-    """
-    Порівняння метрик різних моделей
-    
-    Args:
-        lstm_metrics: Метрики LSTM моделі
-        bert_metrics: Метрики BERT-lite моделі
-        metric_name: Назва метрики ('accuracy', 'f1_weighted', 'f1_per_class')
-        class_names: Назви класів (потрібно для 'f1_per_class')
-        title: Заголовок графіка
-    """
-    if metric_name == 'f1_per_class':
-        if class_names is None:
-            raise ValueError("class_names повинні бути вказані для метрики 'f1_per_class'")
-        
-        # Візуалізація F1-міри для кожного класу
-        plt.figure(figsize=(14, 6))
-        x = np.arange(len(class_names))
-        width = 0.35
-        
-        plt.bar(x - width/2, lstm_metrics, width, label='LSTM')
-        plt.bar(x + width/2, bert_metrics, width, label='BERT-lite')
-        
-        plt.xlabel('Клас')
-        plt.ylabel('F1-міра')
-        plt.title(title or 'Порівняння F1-міри за класами')
-        plt.xticks(x, class_names, rotation=45)
-        plt.ylim(0, 1)
-        plt.legend()
-        plt.grid(axis='y')
-        plt.tight_layout()
-        if title:
-            plt.savefig(f'{title.lower().replace(" ", "_")}.png')
-        else:
-            plt.savefig('f1_per_class_comparison.png')
-        plt.show()
-    else:
-        # Візуалізація загальних метрик
-        metrics = ['Accuracy', 'Precision', 'Recall', 'F1']
-        lstm_values = [lstm_metrics['accuracy'], lstm_metrics['precision'], 
-                      lstm_metrics['recall'], lstm_metrics['f1']]
-        bert_values = [bert_metrics['accuracy'], bert_metrics['precision'], 
-                      bert_metrics['recall'], bert_metrics['f1']]
-        
-        plt.figure(figsize=(10, 6))
-        x = np.arange(len(metrics))
-        width = 0.35
-        
-        plt.bar(x - width/2, lstm_values, width, label='LSTM')
-        plt.bar(x + width/2, bert_values, width, label='BERT-lite')
-        
-        plt.xlabel('Метрика')
-        plt.ylabel('Значення')
-        plt.title(title or 'Порівняння загальних метрик')
-        plt.xticks(x, metrics)
-        plt.ylim(0, 1)
-        plt.legend()
-        plt.grid(axis='y')
-        plt.tight_layout()
-        if title:
-            plt.savefig(f'{title.lower().replace(" ", "_")}.png')
-        else:
-            plt.savefig('metrics_comparison.png')
-        plt.show()
-
-def plot_data_size_comparison(data_sizes, lstm_f1s, bert_f1s, title='Залежність F1-міри від обсягу даних'):
-    """
-    Візуалізація залежності F1-міри від обсягу навчальних даних
-    
-    Args:
-        data_sizes: Відсотки обсягу даних
-        lstm_f1s: F1-міри для LSTM моделі
-        bert_f1s: F1-міри для BERT-lite моделі
-        title: Заголовок графіка
-    """
-    plt.figure(figsize=(10, 6))
-    plt.plot(data_sizes, lstm_f1s, 'o-', label='LSTM')
-    plt.plot(data_sizes, bert_f1s, 's-', label='BERT-lite')
-    plt.xlabel('Відсоток навчальних даних (%)')
-    plt.ylabel('F1-міра')
-    plt.title(title)
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f'{title.lower().replace(" ", "_")}.png')
-    plt.show()
-
-def save_model(model, model_path, config_path, metadata):
-    """
-    Збереження моделі та її конфігурації
-    
-    Args:
-        model: Модель для збереження
-        model_path: Шлях для збереження ваг моделі
-        config_path: Шлях для збереження конфігурації
-        metadata: Метадані моделі (словник)
-    """
-    # Створення директорії, якщо вона не існує
-    os.makedirs(os.path.dirname(model_path), exist_ok=True)
-    
-    # Збереження ваг моделі
-    torch.save(model.state_dict(), model_path)
-    
-    # Збереження конфігурації
-    with open(config_path, 'w') as f:
-        json.dump(metadata, f, indent=4)
-    
-    print(f"Модель збережена в {model_path}")
-    print(f"Конфігурація збережена в {config_path}")
-
-def load_lstm_model(model_path, config_path, device='cuda'):
-    """
-    Завантаження LSTM моделі
-    
-    Args:
-        model_path: Шлях до ваг моделі
-        config_path: Шлях до конфігурації
-        device: Пристрій для обчислень
+        model_path: Путь к сохраненной модели
+        test_data: Тестовые данные
+        device: Устройство для инференса
         
     Returns:
-        Завантажена модель та її метадані
+        tuple: (f1_score, classification_report, confusion_matrix)
     """
-    from lstm_model import LSTMModel
+    print("Оценка LSTM модели...")
     
-    # Завантаження конфігурації
-    with open(config_path, 'r') as f:
-        config = json.load(f)
+    # Создание итераторов данных
+    TEXT, LABEL, test_iterator = create_data_iterators(None, None, test_data, test_only=True)
     
-    # Створення моделі
-    model = LSTMModel(
-        vocab_size=config['vocab_size'],
-        embedding_dim=config['embedding_dim'],
-        hidden_dim=config['hidden_dim'],
-        output_dim=config['output_dim'],
-        n_layers=config['n_layers'],
-        bidirectional=config['bidirectional'],
-        dropout=config['dropout'],
-        pad_idx=config['pad_idx']
+    # Параметры модели
+    INPUT_DIM = len(TEXT.vocab)
+    EMBEDDING_DIM = 300
+    HIDDEN_DIM = 256
+    OUTPUT_DIM = len(LABEL.vocab)
+    N_LAYERS = 2
+    BIDIRECTIONAL = True
+    DROPOUT = 0.3
+    PAD_IDX = TEXT.vocab.stoi[TEXT.pad_token]
+    
+    # Инициализация модели
+    model = LSTMClassifier(
+        INPUT_DIM, 
+        EMBEDDING_DIM, 
+        HIDDEN_DIM, 
+        OUTPUT_DIM, 
+        N_LAYERS, 
+        BIDIRECTIONAL, 
+        DROPOUT, 
+        PAD_IDX
     )
     
-    # Завантаження ваг
+    # Загрузка весов модели
     model.load_state_dict(torch.load(model_path, map_location=device))
-    
-    # Переміщення моделі на пристрій
     model = model.to(device)
-    
-    return model, config
-
-def load_bert_model(model_path, config_path, device='cuda'):
-    """
-    Завантаження BERT-lite моделі
-    
-    Args:
-        model_path: Шлях до ваг моделі
-        config_path: Шлях до конфігурації
-        device: Пристрій для обчислень
-        
-    Returns:
-        Завантажена модель та її метадані
-    """
-    from bert_lite_model import BERTLiteModel
-    
-    # Завантаження конфігурації
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-    
-    # Створення моделі
-    model = BERTLiteModel(
-        num_classes=config['num_classes'],
-        hidden_size=config['hidden_size'],
-        num_hidden_layers=config['num_hidden_layers'],
-        num_attention_heads=config['num_attention_heads'],
-        intermediate_size=config['intermediate_size'],
-        dropout=config['dropout']
-    )
-    
-    # Завантаження ваг
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    
-    # Переміщення моделі на пристрій
-    model = model.to(device)
-    
-    return model, config
-
-def predict_emotion(text, model, preprocessing_func, idx2label, device='cuda'):
-    """
-    Передбачення емоції для вхідного тексту
-    
-    Args:
-        text: Вхідний текст
-        model: Модель (LSTM або BERT-lite)
-        preprocessing_func: Функція препроцесингу
-        idx2label: Словник відображення індексів у мітки
-        device: Пристрій для обчислень
-        
-    Returns:
-        Кортеж з передбаченою емоцією та ймовірністю
-    """
-    # Переведення моделі в режим оцінки
     model.eval()
     
-    # Препроцесинг тексту
-    inputs = preprocessing_func(text)
+    # Получение предсказаний
+    all_preds = []
+    all_labels = []
     
-    # Переміщення входів на пристрій
-    inputs = [tensor.to(device) for tensor in inputs]
-    
-    # Передбачення
     with torch.no_grad():
-        if len(inputs) == 2:  # LSTM або BERT
-            outputs = model(inputs[0], inputs[1])
-        else:
-            # Цей блок не повинен виконуватися, але для повноти
-            outputs = model(inputs[0])
+        for batch in tqdm(test_iterator, desc="Инференс"):
+            text, text_lengths = batch.text
+            labels = batch.label
+            
+            text = text.to(device)
+            text_lengths = text_lengths.to(device)
+            
+            predictions = model(text, text_lengths).squeeze(1)
+            preds = predictions.argmax(dim=1).cpu().numpy()
+            labs = labels.cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labs)
     
-    # Отримання ймовірностей
-    probabilities = torch.softmax(outputs, dim=1)[0]
+    # Вычисление метрик
+    f1 = f1_score(all_labels, all_preds, average='macro')
+    report = classification_report(all_labels, all_preds, target_names=LABEL.vocab.itos)
     
-    # Отримання індексу найбільш ймовірного класу
-    predicted_idx = probabilities.argmax().item()
+    # Создание матрицы ошибок
+    cm = create_confusion_matrix(all_labels, all_preds, LABEL.vocab.itos, "LSTM")
     
-    # Отримання емоції та ймовірності
-    emotion = idx2label[predicted_idx]
-    probability = probabilities[predicted_idx].item()
+    print(f"LSTM F1-score: {f1:.4f}")
+    print("\nClassification Report:")
+    print(report)
     
-    return emotion, probability, probabilities.cpu().numpy()
+    return f1, report, cm
 
-def compare_models_on_different_data_sizes(lstm_model, bert_model, 
-                                          train_dataset, val_dataloader, test_dataloader,
-                                          fractions=[0.1, 0.25, 0.5, 0.75, 1.0],
-                                          device='cuda'):
+# Функция для оценки BERT-lite модели
+def evaluate_bert_model(model_path, test_data, device='cuda' if torch.cuda.is_available() else 'cpu'):
     """
-    Порівняння LSTM та BERT-lite моделей на різних обсягах навчальних даних
+    Оценивает BERT-lite модель на тестовых данных и создает матрицу ошибок.
     
     Args:
-        lstm_model: Модель LSTM
-        bert_model: Модель BERT-lite
-        train_dataset: Тренувальний датасет
-        val_dataloader: Валідаційний даталоадер
-        test_dataloader: Тестовий даталоадер
-        fractions: Частки навчальних даних
-        device: Пристрій для обчислень
+        model_path: Путь к сохраненной модели
+        test_data: Тестовые данные
+        device: Устройство для инференса
         
     Returns:
-        Словник з результатами порівняння
+        tuple: (f1_score, classification_report, confusion_matrix)
     """
-    from lstm_model import train_lstm_model, evaluate_lstm_model
-    from bert_lite_model import train_bert_lite_model, evaluate_bert_lite_model
+    print("Оценка BERT-lite модели...")
     
-    # Перетворення фракцій у відсотки для графіка
-    data_sizes = [fraction * 100 for fraction in fractions]
+    # Подготовка данных для BERT
+    _, _, test_dataloader, label_encoder = create_bert_dataloaders(None, None, test_data, test_only=True)
     
-    # Результати
-    lstm_results = []
-    bert_results = []
+    # Количество классов
+    num_classes = len(label_encoder.classes_)
     
-    # Створення підмножин даних
-    subset_sizes = [int(len(train_dataset) * fraction) for fraction in fractions]
+    # Настройка конфигурации BERT-lite
+    from transformers import BertConfig
     
-    for i, size in enumerate(subset_sizes):
-        fraction = fractions[i]
-        print(f"\nТренування на {fraction*100}% даних ({size} зразків)")
-        
-        # Створення підмножини даних
-        indices = torch.randperm(len(train_dataset))[:size]
-        subset = torch.utils.data.Subset(train_dataset, indices)
-        subset_dataloader = torch.utils.data.DataLoader(
-            subset, 
-            batch_size=32,
-            shuffle=True
-        )
-        
-        # Навчання LSTM
-        print("Навчання LSTM моделі...")
-        lstm_copy = type(lstm_model)(
-            vocab_size=lstm_model.embedding.num_embeddings,
-            embedding_dim=lstm_model.embedding.embedding_dim,
-            hidden_dim=lstm_model.lstm.hidden_size,
-            output_dim=lstm_model.fc2.out_features,
-            n_layers=lstm_model.lstm.num_layers,
-            bidirectional=lstm_model.lstm.bidirectional,
-            dropout=lstm_model.dropout.p,
-            pad_idx=0
-        )
-        
-        # Копіювання початкових ваг
-        lstm_copy.load_state_dict(lstm_model.state_dict())
-        
-        # Навчання
-        optimizer = torch.optim.Adam(lstm_copy.parameters(), lr=0.001)
-        criterion = torch.nn.CrossEntropyLoss()
-        
-        lstm_copy, lstm_history = train_lstm_model(
-            lstm_copy, subset_dataloader, val_dataloader,
-            optimizer, criterion, 20, 5, device
-        )
-        
-        # Оцінка LSTM
-        val_loss, val_f1 = evaluate_lstm_model(lstm_copy, test_dataloader, criterion, device)
-        
-        # Навчання BERT-lite
-        print("Навчання BERT-lite моделі...")
-        bert_copy = type(bert_model)(
-            num_classes=bert_model.classifier.out_features,
-            hidden_size=bert_model.config.hidden_size,
-            num_hidden_layers=bert_model.config.num_hidden_layers,
-            num_attention_heads=bert_model.config.num_attention_heads,
-            intermediate_size=bert_model.config.intermediate_size,
-            dropout=bert_model.dropout.p
-        )
-        
-        # Копіювання початкових ваг
-        bert_copy.load_state_dict(bert_model.state_dict())
-        
-        # Навчання
-        optimizer = torch.optim.AdamW(bert_copy.parameters(), lr=2e-5)
-        criterion = torch.nn.CrossEntropyLoss()
-        
-        bert_copy, bert_history = train_bert_lite_model(
-            bert_copy, subset_dataloader, val_dataloader,
-            optimizer, criterion, 10, 3, device
-        )
-        
-        # Оцінка BERT-lite
-        bert_val_loss, bert_val_f1 = evaluate_bert_lite_model(bert_copy, test_dataloader, criterion, device)
-        
-        # Збереження результатів
-        lstm_results.append(val_f1)
-        bert_results.append(bert_val_f1)
-        
-        print(f"LSTM F1: {val_f1:.4f}, BERT-lite F1: {bert_val_f1:.4f}")
+    config = BertConfig(
+        vocab_size=30522,  # Стандартный размер словаря для BERT
+        hidden_size=512,
+        num_hidden_layers=6,
+        num_attention_heads=8,
+        intermediate_size=2048,
+        hidden_dropout_prob=0.1,
+        attention_probs_dropout_prob=0.1,
+        max_position_embeddings=512,
+        type_vocab_size=2,
+        num_labels=num_classes
+    )
     
-    # Повернення результатів
-    return {
-        'data_sizes': data_sizes,
-        'lstm_f1s': lstm_results,
-        'bert_f1s': bert_results
-    }
+    # Инициализация модели
+    model = BERTLiteClassifier(config)
+    
+    # Загрузка весов модели
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model = model.to(device)
+    model.eval()
+    
+    # Получение предсказаний
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for batch in tqdm(test_dataloader, desc="Инференс"):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            
+            outputs = model(input_ids, attention_mask=attention_mask)
+            logits = outputs.logits
+            preds = logits.argmax(dim=1).cpu().numpy()
+            labs = labels.cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labs)
+    
+    # Вычисление метрик
+    f1 = f1_score(all_labels, all_preds, average='macro')
+    report = classification_report(all_labels, all_preds, target_names=label_encoder.classes_)
+    
+    # Создание матрицы ошибок
+    cm = create_confusion_matrix(all_labels, all_preds, label_encoder.classes_, "BERT-lite")
+    
+    print(f"BERT-lite F1-score: {f1:.4f}")
+    print("\nClassification Report:")
+    print(report)
+    
+    return f1, report, cm
+
+# Функция для визуализации сравнения моделей
+def visualize_model_comparison(lstm_f1, bert_f1, lstm_report, bert_report):
+    """
+    Визуализирует сравнение моделей по различным метрикам.
+    
+    Args:
+        lstm_f1: F1-score LSTM модели
+        bert_f1: F1-score BERT-lite модели
+        lstm_report: Отчет о классификации LSTM модели
+        bert_report: Отчет о классификации BERT-lite модели
+        
+    Returns:
+        None
+    """
+    # Парсинг отчетов классификации
+    lstm_report_dict = classification_report_to_dict(lstm_report)
+    bert_report_dict = classification_report_to_dict(bert_report)
+    
+    # Сравнение F1-score по эмоциям
+    emotions = list(lstm_report_dict.keys())
+    if 'accuracy' in emotions:
+        emotions.remove('accuracy')
+    if 'macro avg' in emotions:
+        emotions.remove('macro avg')
+    if 'weighted avg' in emotions:
+        emotions.remove('weighted avg')
+    
+    lstm_f1_per_emotion = [lstm_report_dict[emotion]['f1-score'] for emotion in emotions]
+    bert_f1_per_emotion = [bert_report_dict[emotion]['f1-score'] for emotion in emotions]
+    
+    # Создание графика сравнения F1-score по эмоциям
+    plt.figure(figsize=(14, 8))
+    
+    x = np.arange(len(emotions))
+    width = 0.35
+    
+    bars1 = plt.bar(x - width/2, lstm_f1_per_emotion, width, label='LSTM')
+    bars2 = plt.bar(x + width/2, bert_f1_per_emotion, width, label='BERT-lite')
+    
+    plt.xlabel('Эмоция')
+    plt.ylabel('F1-score')
+    plt.title('Сравнение F1-score моделей для разных эмоций')
+    plt.xticks(x, emotions)
+    plt.legend()
+    
+    # Добавление значений над столбцами
+    def add_labels(bars):
+        for bar in bars:
+            height = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2, height + 0.01,
+                    f'{height:.2f}', ha='center', va='bottom')
+    
+    add_labels(bars1)
+    add_labels(bars2)
+    
+    plt.tight_layout()
+    plt.savefig('emotion_comparison.png', dpi=300)
+    plt.close()
+    
+    # Сравнение общего F1-score
+    plt.figure(figsize=(10, 6))
+    
+    plt.bar(['LSTM', 'BERT-lite'], [lstm_f1, bert_f1])
+    plt.xlabel('Модель')
+    plt.ylabel('Macro F1-score')
+    plt.title('Сравнение общего F1-score моделей')
+    
+    # Добавление значений над столбцами
+    plt.text(0, lstm_f1 + 0.01, f'{lstm_f1:.4f}', ha='center', va='bottom')
+    plt.text(1, bert_f1 + 0.01, f'{bert_f1:.4f}', ha='center', va='bottom')
+    
+    plt.tight_layout()
+    plt.savefig('model_comparison.png', dpi=300)
+    plt.close()
+    
+    # Создание сводной таблицы с результатами
+    results_df = pd.DataFrame({
+        'LSTM': [lstm_report_dict[emotion]['f1-score'] for emotion in emotions],
+        'BERT-lite': [bert_report_dict[emotion]['f1-score'] for emotion in emotions],
+        'Difference': [bert_report_dict[emotion]['f1-score'] - lstm_report_dict[emotion]['f1-score'] for emotion in emotions]
+    }, index=emotions)
+    
+    # Добавление общих метрик
+    results_df.loc['macro avg'] = [
+        lstm_report_dict['macro avg']['f1-score'],
+        bert_report_dict['macro avg']['f1-score'],
+        bert_report_dict['macro avg']['f1-score'] - lstm_report_dict['macro avg']['f1-score']
+    ]
+    
+    results_df.loc['weighted avg'] = [
+        lstm_report_dict['weighted avg']['f1-score'],
+        bert_report_dict['weighted avg']['f1-score'],
+        bert_report_dict['weighted avg']['f1-score'] - lstm_report_dict['weighted avg']['f1-score']
+    ]
+    
+    # Сохранение результатов в CSV
+    results_df.to_csv('model_comparison_results.csv')
+    
+    print("Результаты сравнения сохранены в model_comparison_results.csv")
+    
+    return results_df
+
+# Вспомогательная функция для преобразования отчета классификации в словарь
+def classification_report_to_dict(report):
+    """
+    Преобразует строковый отчет классификации в словарь.
+    
+    Args:
+        report: Строковый отчет классификации
+        
+    Returns:
+        dict: Словарь с метриками
+    """
+    lines = report.split('\n')
+    report_dict = {}
+    
+    for line in lines[2:-3]:  # Пропускаем первые две строки (заголовки) и последние три (пустые)
+        if not line:
+            continue
+        line = line.strip()
+        if line:
+            line_data = line.split()
+            if len(line_data) < 5:  # Пропускаем строки с некорректным форматом
+                continue
+            
+            class_name = line_data[0]
+            precision = float(line_data[1])
+            recall = float(line_data[2])
+            f1 = float(line_data[3])
+            support = int(line_data[4])
+            
+            report_dict[class_name] = {
+                'precision': precision,
+                'recall': recall,
+                'f1-score': f1,
+                'support': support
+            }
+    
+    # Добавляем средние значения
+    for line in lines[-3:]:  # Последние три строки содержат средние значения
+        if not line:
+            continue
+        line = line.strip()
+        if line:
+            line_data = line.split()
+            
+            # Проверяем, содержит ли строка информацию о средних значениях
+            if 'accuracy' in line:
+                accuracy = float(line_data[1])
+                report_dict['accuracy'] = accuracy
+                continue
+                
+            if len(line_data) >= 6:  # Строки с avg
+                avg_type = line_data[0] + ' ' + line_data[1]  # 'macro avg' или 'weighted avg'
+                precision = float(line_data[2])
+                recall = float(line_data[3])
+                f1 = float(line_data[4])
+                support = int(line_data[5])
+                
+                report_dict[avg_type] = {
+                    'precision': precision,
+                    'recall': recall,
+                    'f1-score': f1,
+                    'support': support
+                }
+    
+    return report_dict
+
+# Основная функция для оценки и сравнения моделей
+def evaluate_and_compare_models(lstm_model_path, bert_model_path):
+    """
+    Оценивает и сравнивает LSTM и BERT-lite модели.
+    
+    Args:
+        lstm_model_path: Путь к сохраненной LSTM модели
+        bert_model_path: Путь к сохраненной BERT-lite модели
+        
+    Returns:
+        pd.DataFrame: Сводная таблица с результатами сравнения
+    """
+    # Загрузка данных
+    _, _, test_data = load_data()
+    
+    # Оценка LSTM модели
+    lstm_f1, lstm_report, _ = evaluate_lstm_model(lstm_model_path, test_data)
+    
+    # Оценка BERT-lite модели
+    bert_f1, bert_report, _ = evaluate_bert_model(bert_model_path, test_data)
+    
+    # Визуализация сравнения
+    results_df = visualize_model_comparison(lstm_f1, bert_f1, lstm_report, bert_report)
+    
+    return results_df
+
+# Пример использования (не запускается при импорте)
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Evaluate and compare LSTM and BERT-lite models.')
+    parser.add_argument('--lstm_model', type=str, required=True, help='Path to LSTM model')
+    parser.add_argument('--bert_model', type=str, required=True, help='Path to BERT-lite model')
+    
+    args = parser.parse_args()
+    
+    # Оценка и сравнение моделей
+    results_df = evaluate_and_compare_models(args.lstm_model, args.bert_model)
+    
+    print("\nСводная таблица с результатами сравнения:")
+    print(results_df)
