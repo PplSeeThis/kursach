@@ -278,7 +278,8 @@ def train_bert_on_subset(train_subset, val_data, test_data, params, device='cuda
     model = model.to(device)
     
     # Настройка оптимизатора
-    from transformers import AdamW, get_linear_schedule_with_warmup
+    from transformers import get_linear_schedule_with_warmup
+    from torch.optim import AdamW
     
     optimizer = AdamW(model.parameters(), lr=params['learning_rate'])
     
