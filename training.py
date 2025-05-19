@@ -1,384 +1,644 @@
-"""
-training.py
-Модуль для навчання та оцінки моделей класифікації емоцій
-"""
-
 import torch
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
-import time
-from sklearn.metrics import f1_score
-from transformers import get_linear_schedule_with_warmup
 import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
+import time
+from tqdm import tqdm
+import os
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-def train_lstm_model(model, train_dataloader, val_dataloader, optimizer, criterion, 
-                    n_epochs, patience, device='cuda'):
+def train_lstm_model(model, train_iterator, val_iterator, optimizer, criterion, n_epochs, device, scheduler=None, patience=5, model_save_path='best_lstm_model.pt'):
     """
-    Навчання LSTM моделі
+    Обучение LSTM модели
     
     Args:
-        model: Модель LSTM
-        train_dataloader: Даталоадер з навчальними даними
-        val_dataloader: Даталоадер з валідаційними даними
-        optimizer: Оптимізатор
-        criterion: Функція втрат
-        n_epochs: Максимальна кількість епох
-        patience: Кількість епох без покращення для раннього зупинення
-        device: Пристрій для обчислень
+        model: LSTM модель
+        train_iterator: даталоадер с тренировочными данными
+        val_iterator: даталоадер с валидационными данными
+        optimizer: оптимизатор
+        criterion: функция потерь
+        n_epochs: количество эпох
+        device: устройство (cpu или cuda)
+        scheduler: планировщик скорости обучения (опционально)
+        patience: количество эпох без улучшения для раннего останова
+        model_save_path: путь для сохранения лучшей модели
         
     Returns:
-        Кортеж з навченою моделлю та історією навчання
+        history: словарь с историей обучения
+        best_model: лучшая модель
+        training_time: время обучения
     """
-    # Переміщення моделі на потрібний пристрій
-    model = model.to(device)
-    
-    # Списки для відстеження метрик
-    train_losses = []
-    val_losses = []
-    train_f1s = []
-    val_f1s = []
-    
-    # Параметри для раннього зупинення
+    # Инициализация переменных для отслеживания прогресса
     best_val_f1 = 0
     epochs_without_improvement = 0
-    best_model_state = None
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'train_acc': [],
+        'val_acc': [],
+        'train_f1': [],
+        'val_f1': []
+    }
     
-    # Час початку навчання
+    # Перемещение модели на указанное устройство
+    model = model.to(device)
+    
+    # Замер времени начала обучения
     start_time = time.time()
     
+    # Основной цикл обучения
     for epoch in range(n_epochs):
-        # Навчання
+        # Режим обучения
         model.train()
         epoch_loss = 0
-        
         all_preds = []
         all_labels = []
         
-        for texts, lengths, labels in train_dataloader:
-            # Переміщення даних на потрібний пристрій
-            texts = texts.to(device)
-            lengths = lengths.to(device)
-            labels = labels.to(device)
+        # Прогресс-бар для отслеживания обучения
+        train_bar = tqdm(train_iterator, desc=f'Epoch {epoch+1}/{n_epochs} [Train]')
+        
+        for batch in train_bar:
+            # Извлечение данных из батча
+            text = batch['text'].to(device)
+            text_lengths = batch['length'].to(device)
+            labels = batch['label'].to(device)
             
-            # Обнулення градієнтів
+            # Обнуление градиентов
             optimizer.zero_grad()
             
-            # Прямий прохід
-            predictions = model(texts, lengths)
+            # Прямой проход
+            predictions = model(text, text_lengths)
             
-            # Обчислення втрати
+            # Вычисление потерь
             loss = criterion(predictions, labels)
             
-            # Зворотне поширення
+            # Обратное распространение ошибки
             loss.backward()
             
-            # Оновлення ваг
+            # Обновление весов
             optimizer.step()
             
-            # Збереження втрати
+            # Накопление потерь
             epoch_loss += loss.item()
             
-            # Отримання прогнозів
-            _, predicted = torch.max(predictions, 1)
-            all_preds.extend(predicted.cpu().numpy())
+            # Сохранение предсказаний и истинных меток для расчета метрик
+            preds = torch.argmax(predictions, dim=1).cpu().numpy()
+            all_preds.extend(preds)
             all_labels.extend(labels.cpu().numpy())
+            
+            # Обновление прогресс-бара
+            train_bar.set_postfix({'loss': loss.item()})
         
-        # Обчислення середньої втрати та F1 для епохи
-        train_loss = epoch_loss / len(train_dataloader)
-        train_f1 = f1_score(all_labels, all_preds, average='weighted')
+        # Вычисление средних потерь и метрик для эпохи
+        train_loss = epoch_loss / len(train_iterator)
+        train_acc = accuracy_score(all_labels, all_preds)
+        _, _, train_f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='macro')
         
-        train_losses.append(train_loss)
-        train_f1s.append(train_f1)
+        # Сохранение метрик обучения
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['train_f1'].append(train_f1)
         
-        # Валідація
-        val_loss, val_f1 = evaluate_lstm_model(model, val_dataloader, criterion, device)
-        val_losses.append(val_loss)
-        val_f1s.append(val_f1)
+        # Валидация
+        val_loss, val_acc, val_f1 = evaluate_lstm_model(model, val_iterator, criterion, device)
         
-        # Вивід прогресу
+        # Сохранение метрик валидации
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        history['val_f1'].append(val_f1)
+        
+        # Обновление планировщика скорости обучения
+        if scheduler is not None:
+            scheduler.step(val_loss)
+        
+        # Вывод результатов эпохи
         print(f'Epoch: {epoch+1}/{n_epochs}')
-        print(f'Train Loss: {train_loss:.4f}, Train F1: {train_f1:.4f}')
-        print(f'Val Loss: {val_loss:.4f}, Val F1: {val_f1:.4f}')
+        print(f'\tTrain Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Train F1: {train_f1:.4f}')
+        print(f'\tVal Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Val F1: {val_f1:.4f}')
         
-        # Раннє зупинення
+        # Сохранение лучшей модели
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
+            torch.save(model.state_dict(), model_save_path)
             epochs_without_improvement = 0
-            best_model_state = model.state_dict().copy()
         else:
             epochs_without_improvement += 1
-            
+        
+        # Ранний останов
         if epochs_without_improvement >= patience:
             print(f'Early stopping after {epoch+1} epochs')
             break
     
-    # Загальний час навчання
+    # Замер времени окончания обучения
     training_time = time.time() - start_time
     print(f'Training completed in {training_time:.2f} seconds')
     
-    # Завантаження найкращої моделі
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
+    # Загрузка лучшей модели
+    model.load_state_dict(torch.load(model_save_path))
     
-    return model, {
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'train_f1s': train_f1s,
-        'val_f1s': val_f1s,
-        'best_val_f1': best_val_f1,
-        'training_time': training_time
-    }
+    return history, model, training_time
 
-def evaluate_lstm_model(model, dataloader, criterion, device='cuda'):
+def evaluate_lstm_model(model, iterator, criterion, device):
     """
-    Оцінка LSTM моделі
+    Оценка LSTM модели
     
     Args:
-        model: Модель LSTM
-        dataloader: Даталоадер з даними
-        criterion: Функція втрат
-        device: Пристрій для обчислень
+        model: LSTM модель
+        iterator: даталоадер с данными для оценки
+        criterion: функция потерь
+        device: устройство (cpu или cuda)
         
     Returns:
-        Кортеж з середньою втратою та F1-мірою
+        val_loss: средние потери
+        val_acc: точность
+        val_f1: F1-мера
     """
-    # Перехід у режим оцінки
+    # Режим оценки
     model.eval()
     
-    # Метрики
-    val_loss = 0
+    epoch_loss = 0
     all_preds = []
     all_labels = []
     
-    # Вимкнення градієнтів
+    # Отключение вычисления градиентов для ускорения оценки
     with torch.no_grad():
-        for texts, lengths, labels in dataloader:
-            # Переміщення даних на потрібний пристрій
-            texts = texts.to(device)
-            lengths = lengths.to(device)
-            labels = labels.to(device)
+        # Прогресс-бар для отслеживания оценки
+        val_bar = tqdm(iterator, desc='Evaluating')
+        
+        for batch in val_bar:
+            # Извлечение данных из батча
+            text = batch['text'].to(device)
+            text_lengths = batch['length'].to(device)
+            labels = batch['label'].to(device)
             
-            # Прямий прохід
-            predictions = model(texts, lengths)
+            # Прямой проход
+            predictions = model(text, text_lengths)
             
-            # Обчислення втрати
+            # Вычисление потерь
             loss = criterion(predictions, labels)
-            val_loss += loss.item()
             
-            # Отримання прогнозів
-            _, predicted = torch.max(predictions, 1)
-            all_preds.extend(predicted.cpu().numpy())
+            # Накопление потерь
+            epoch_loss += loss.item()
+            
+            # Сохранение предсказаний и истинных меток для расчета метрик
+            preds = torch.argmax(predictions, dim=1).cpu().numpy()
+            all_preds.extend(preds)
             all_labels.extend(labels.cpu().numpy())
+            
+            # Обновление прогресс-бара
+            val_bar.set_postfix({'loss': loss.item()})
     
-    # Обчислення середньої втрати та F1
-    avg_loss = val_loss / len(dataloader)
-    f1 = f1_score(all_labels, all_preds, average='weighted')
+    # Вычисление средних потерь и метрик
+    val_loss = epoch_loss / len(iterator)
+    val_acc = accuracy_score(all_labels, all_preds)
+    _, _, val_f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='macro')
     
-    return avg_loss, f1
+    return val_loss, val_acc, val_f1
 
-def train_bert_lite_model(model, train_dataloader, val_dataloader, optimizer, criterion, 
-                          n_epochs, patience, device='cuda'):
+def train_bert_model(model, train_iterator, val_iterator, optimizer, criterion, n_epochs, device, scheduler=None, patience=3, model_save_path='best_bert_model.pt'):
     """
-    Навчання BERT-lite моделі
+    Обучение BERT-lite модели
     
     Args:
-        model: Модель BERT-lite
-        train_dataloader: Даталоадер з навчальними даними
-        val_dataloader: Даталоадер з валідаційними даними
-        optimizer: Оптимізатор
-        criterion: Функція втрат
-        n_epochs: Максимальна кількість епох
-        patience: Кількість епох без покращення для раннього зупинення
-        device: Пристрій для обчислень
+        model: BERT-lite модель
+        train_iterator: даталоадер с тренировочными данными
+        val_iterator: даталоадер с валидационными данными
+        optimizer: оптимизатор
+        criterion: функция потерь
+        n_epochs: количество эпох
+        device: устройство (cpu или cuda)
+        scheduler: планировщик скорости обучения (опционально)
+        patience: количество эпох без улучшения для раннего останова
+        model_save_path: путь для сохранения лучшей модели
         
     Returns:
-        Кортеж з навченою моделлю та історією навчання
+        history: словарь с историей обучения
+        best_model: лучшая модель
+        training_time: время обучения
     """
-    # Переміщення моделі на потрібний пристрій
-    model = model.to(device)
-    
-    # Створення планувальника швидкості навчання
-    total_steps = len(train_dataloader) * n_epochs
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=int(0.1 * total_steps),
-        num_training_steps=total_steps
-    )
-    
-    # Списки для відстеження метрик
-    train_losses = []
-    val_losses = []
-    train_f1s = []
-    val_f1s = []
-    
-    # Параметри для раннього зупинення
+    # Инициализация переменных для отслеживания прогресса
     best_val_f1 = 0
     epochs_without_improvement = 0
-    best_model_state = None
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'train_acc': [],
+        'val_acc': [],
+        'train_f1': [],
+        'val_f1': []
+    }
     
-    # Час початку навчання
+    # Перемещение модели на указанное устройство
+    model = model.to(device)
+    
+    # Замер времени начала обучения
     start_time = time.time()
     
+    # Основной цикл обучения
     for epoch in range(n_epochs):
-        # Навчання
+        # Режим обучения
         model.train()
         epoch_loss = 0
-        
         all_preds = []
         all_labels = []
         
-        for batch in train_dataloader:
-            # Розпакування батчу
-            input_ids, attention_mask, labels = [b.to(device) for b in batch]
+        # Прогресс-бар для отслеживания обучения
+        train_bar = tqdm(train_iterator, desc=f'Epoch {epoch+1}/{n_epochs} [Train]')
+        
+        for batch in train_bar:
+            # Извлечение данных из батча
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['label'].to(device)
             
-            # Обнулення градієнтів
+            # Обнуление градиентов
             optimizer.zero_grad()
             
-            # Прямий прохід
-            outputs = model(input_ids, attention_mask)
+            # Прямой проход
+            predictions = model(input_ids, attention_mask)
             
-            # Обчислення втрати
-            loss = criterion(outputs, labels)
+            # Вычисление потерь
+            loss = criterion(predictions, labels)
             
-            # Зворотне поширення
+            # Обратное распространение ошибки
             loss.backward()
             
-            # Обмеження градієнтів (gradient clipping)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            
-            # Оновлення ваг та планувальника
+            # Обновление весов
             optimizer.step()
-            scheduler.step()
             
-            # Збереження втрати
+            # Накопление потерь
             epoch_loss += loss.item()
             
-            # Отримання прогнозів
-            _, predicted = torch.max(outputs, 1)
-            all_preds.extend(predicted.cpu().numpy())
+            # Сохранение предсказаний и истинных меток для расчета метрик
+            preds = torch.argmax(predictions, dim=1).cpu().numpy()
+            all_preds.extend(preds)
             all_labels.extend(labels.cpu().numpy())
+            
+            # Обновление прогресс-бара
+            train_bar.set_postfix({'loss': loss.item()})
         
-        # Обчислення середньої втрати та F1 для епохи
-        train_loss = epoch_loss / len(train_dataloader)
-        train_f1 = f1_score(all_labels, all_preds, average='weighted')
+        # Вычисление средних потерь и метрик для эпохи
+        train_loss = epoch_loss / len(train_iterator)
+        train_acc = accuracy_score(all_labels, all_preds)
+        _, _, train_f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='macro')
         
-        train_losses.append(train_loss)
-        train_f1s.append(train_f1)
+        # Сохранение метрик обучения
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['train_f1'].append(train_f1)
         
-        # Валідація
-        val_loss, val_f1 = evaluate_bert_lite_model(model, val_dataloader, criterion, device)
-        val_losses.append(val_loss)
-        val_f1s.append(val_f1)
+        # Валидация
+        val_loss, val_acc, val_f1 = evaluate_bert_model(model, val_iterator, criterion, device)
         
-        # Вивід прогресу
+        # Сохранение метрик валидации
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        history['val_f1'].append(val_f1)
+        
+        # Обновление планировщика скорости обучения
+        if scheduler is not None:
+            scheduler.step(val_loss)
+        
+        # Вывод результатов эпохи
         print(f'Epoch: {epoch+1}/{n_epochs}')
-        print(f'Train Loss: {train_loss:.4f}, Train F1: {train_f1:.4f}')
-        print(f'Val Loss: {val_loss:.4f}, Val F1: {val_f1:.4f}')
+        print(f'\tTrain Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Train F1: {train_f1:.4f}')
+        print(f'\tVal Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Val F1: {val_f1:.4f}')
         
-        # Раннє зупинення
+        # Сохранение лучшей модели
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
+            torch.save(model.state_dict(), model_save_path)
             epochs_without_improvement = 0
-            best_model_state = model.state_dict().copy()
         else:
             epochs_without_improvement += 1
-            
+        
+        # Ранний останов
         if epochs_without_improvement >= patience:
             print(f'Early stopping after {epoch+1} epochs')
             break
     
-    # Загальний час навчання
+    # Замер времени окончания обучения
     training_time = time.time() - start_time
     print(f'Training completed in {training_time:.2f} seconds')
     
-    # Завантаження найкращої моделі
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
+    # Загрузка лучшей модели
+    model.load_state_dict(torch.load(model_save_path))
     
-    return model, {
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'train_f1s': train_f1s,
-        'val_f1s': val_f1s,
-        'best_val_f1': best_val_f1,
-        'training_time': training_time
-    }
+    return history, model, training_time
 
-def evaluate_bert_lite_model(model, dataloader, criterion, device='cuda'):
+def evaluate_bert_model(model, iterator, criterion, device):
     """
-    Оцінка BERT-lite моделі
+    Оценка BERT-lite модели
     
     Args:
-        model: Модель BERT-lite
-        dataloader: Даталоадер з даними
-        criterion: Функція втрат
-        device: Пристрій для обчислень
+        model: BERT-lite модель
+        iterator: даталоадер с данными для оценки
+        criterion: функция потерь
+        device: устройство (cpu или cuda)
         
     Returns:
-        Кортеж з середньою втратою та F1-мірою
+        val_loss: средние потери
+        val_acc: точность
+        val_f1: F1-мера
     """
-    # Перехід у режим оцінки
+    # Режим оценки
     model.eval()
     
-    # Метрики
-    val_loss = 0
+    epoch_loss = 0
     all_preds = []
     all_labels = []
     
-    # Вимкнення градієнтів
+    # Отключение вычисления градиентов для ускорения оценки
     with torch.no_grad():
-        for batch in dataloader:
-            # Розпакування даних
-            input_ids, attention_mask, labels = [b.to(device) for b in batch]
+        # Прогресс-бар для отслеживания оценки
+        val_bar = tqdm(iterator, desc='Evaluating')
+        
+        for batch in val_bar:
+            # Извлечение данных из батча
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['label'].to(device)
             
-            # Прямий прохід
-            outputs = model(input_ids, attention_mask)
+            # Прямой проход
+            predictions = model(input_ids, attention_mask)
             
-            # Обчислення втрати
-            loss = criterion(outputs, labels)
-            val_loss += loss.item()
+            # Вычисление потерь
+            loss = criterion(predictions, labels)
             
-            # Отримання прогнозів
-            _, predicted = torch.max(outputs, 1)
-            all_preds.extend(predicted.cpu().numpy())
+            # Накопление потерь
+            epoch_loss += loss.item()
+            
+            # Сохранение предсказаний и истинных меток для расчета метрик
+            preds = torch.argmax(predictions, dim=1).cpu().numpy()
+            all_preds.extend(preds)
             all_labels.extend(labels.cpu().numpy())
+            
+            # Обновление прогресс-бара
+            val_bar.set_postfix({'loss': loss.item()})
     
-    # Обчислення середньої втрати та F1
-    avg_loss = val_loss / len(dataloader)
-    f1 = f1_score(all_labels, all_preds, average='weighted')
+    # Вычисление средних потерь и метрик
+    val_loss = epoch_loss / len(iterator)
+    val_acc = accuracy_score(all_labels, all_preds)
+    _, _, val_f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='macro')
     
-    return avg_loss, f1
+    return val_loss, val_acc, val_f1
 
-def plot_training_history(history, title='Історія навчання'):
+def test_model(model, test_iterator, criterion, device, model_type='lstm'):
     """
-    Візуалізація процесу навчання
+    Тестирование модели
     
     Args:
-        history: Словник з історією навчання
-        title: Заголовок графіка
+        model: модель (LSTM или BERT-lite)
+        test_iterator: даталоадер с тестовыми данными
+        criterion: функция потерь
+        device: устройство (cpu или cuda)
+        model_type: тип модели ('lstm' или 'bert')
+        
+    Returns:
+        test_loss: средние потери
+        test_acc: точность
+        test_f1_macro: F1-мера (macro)
+        test_f1_weighted: F1-мера (weighted)
+        precision: точность по классам
+        recall: полнота по классам
+        conf_matrix: матрица ошибок
     """
-    plt.figure(figsize=(15, 5))
+    # Режим оценки
+    model.eval()
     
-    # Графік втрат
+    all_preds = []
+    all_labels = []
+    
+    # Замер времени начала тестирования
+    start_time = time.time()
+    
+    # Отключение вычисления градиентов для ускорения тестирования
+    with torch.no_grad():
+        # Прогресс-бар для отслеживания тестирования
+        test_bar = tqdm(test_iterator, desc='Testing')
+        
+        for batch in test_bar:
+            # Извлечение данных из батча в зависимости от типа модели
+            if model_type == 'lstm':
+                text = batch['text'].to(device)
+                text_lengths = batch['length'].to(device)
+                labels = batch['label'].to(device)
+                
+                # Прямой проход
+                predictions = model(text, text_lengths)
+            else:  # bert
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                labels = batch['label'].to(device)
+                
+                # Прямой проход
+                predictions = model(input_ids, attention_mask)
+            
+            # Сохранение предсказаний и истинных меток для расчета метрик
+            preds = torch.argmax(predictions, dim=1).cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labels.cpu().numpy())
+    
+    # Замер времени окончания тестирования
+    inference_time = time.time() - start_time
+    inference_time_per_sample = inference_time / len(all_labels)
+    
+    # Вычисление метрик
+    test_acc = accuracy_score(all_labels, all_preds)
+    precision, recall, f1_score, _ = precision_recall_fscore_support(all_labels, all_preds, average=None)
+    test_f1_macro = np.mean(f1_score)
+    test_f1_weighted = precision_recall_fscore_support(all_labels, all_preds, average='weighted')[2]
+    
+    # Вычисление матрицы ошибок
+    conf_matrix = confusion_matrix(all_labels, all_preds)
+    
+    # Вывод результатов
+    print(f'Test Accuracy: {test_acc:.4f}')
+    print(f'Test F1 (Macro): {test_f1_macro:.4f}')
+    print(f'Test F1 (Weighted): {test_f1_weighted:.4f}')
+    print(f'Inference time per sample: {inference_time_per_sample*1000:.2f} ms')
+    
+    return test_acc, test_f1_macro, test_f1_weighted, precision, recall, conf_matrix, inference_time_per_sample
+
+def plot_training_curves(history, save_path=None):
+    """
+    Построение графиков обучения
+    
+    Args:
+        history: словарь с историей обучения
+        save_path: путь для сохранения графика
+    """
+    plt.figure(figsize=(16, 6))
+    
+    # График потерь
     plt.subplot(1, 2, 1)
-    plt.plot(history['train_losses'], label='Train')
-    plt.plot(history['val_losses'], label='Validation')
-    plt.title('Втрати')
-    plt.xlabel('Епоха')
-    plt.ylabel('Втрата')
-    plt.legend()
-    plt.grid(True)
+    plt.plot(history['train_loss'], label='Train')
+    plt.plot(history['val_loss'], label='Validation')
+    plt.title('Loss', fontsize=14)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.legend(fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
     
-    # Графік F1-міри
+    # График точности
     plt.subplot(1, 2, 2)
-    plt.plot(history['train_f1s'], label='Train')
-    plt.plot(history['val_f1s'], label='Validation')
-    plt.title('F1-міра')
-    plt.xlabel('Епоха')
-    plt.ylabel('F1')
-    plt.legend()
-    plt.grid(True)
+    plt.plot(history['train_f1'], label='Train F1')
+    plt.plot(history['val_f1'], label='Validation F1')
+    plt.title('F1 Score', fontsize=14)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('F1 Score', fontsize=12)
+    plt.legend(fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
     
-    plt.suptitle(title)
     plt.tight_layout()
-    plt.savefig(f'{title.lower().replace(" ", "_")}.png')
-    plt.show()
+    
+    if save_path:
+        plt.savefig(save_path)
+        plt.close()
+    else:
+        plt.show()
+
+def plot_confusion_matrix(conf_matrix, class_names, model_name, normalize=True, save_path=None):
+    """
+    Построение матрицы ошибок
+    
+    Args:
+        conf_matrix: матрица ошибок
+        class_names: названия классов
+        model_name: название модели
+        normalize: нормализовать ли значения
+        save_path: путь для сохранения графика
+    """
+    plt.figure(figsize=(10, 8))
+    
+    if normalize:
+        # Нормализация по строкам (истинные метки)
+        conf_matrix = conf_matrix.astype('float') / conf_matrix.sum(axis=1)[:, np.newaxis]
+        fmt = '.2f'
+        title = f'Normalized Confusion Matrix - {model_name}'
+    else:
+        fmt = 'd'
+        title = f'Confusion Matrix - {model_name}'
+    
+    # Создание тепловой карты
+    sns.heatmap(conf_matrix, annot=True, fmt=fmt, cmap='Blues', 
+                xticklabels=class_names, yticklabels=class_names)
+    
+    plt.title(title, fontsize=14)
+    plt.ylabel('True Label', fontsize=12)
+    plt.xlabel('Predicted Label', fontsize=12)
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path)
+        plt.close()
+    else:
+        plt.show()
+
+def plot_f1_scores_by_emotion(precision, recall, f1, class_names, model_name, save_path=None):
+    """
+    Построение графика F1-мер для каждой эмоции
+    
+    Args:
+        precision: точность по классам
+        recall: полнота по классам
+        f1: F1-мера по классам
+        class_names: названия классов
+        model_name: название модели
+        save_path: путь для сохранения графика
+    """
+    plt.figure(figsize=(12, 6))
+    
+    x = np.arange(len(class_names))
+    width = 0.25
+    
+    plt.bar(x - width, precision, width, label='Precision')
+    plt.bar(x, recall, width, label='Recall')
+    plt.bar(x + width, f1, width, label='F1')
+    
+    plt.title(f'Metrics by Emotion - {model_name}', fontsize=14)
+    plt.xlabel('Emotion', fontsize=12)
+    plt.ylabel('Score', fontsize=12)
+    plt.xticks(x, class_names, rotation=45)
+    plt.legend(fontsize=12)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path)
+        plt.close()
+    else:
+        plt.show()
+
+def compare_models_f1(f1_scores_lstm, f1_scores_bert, class_names, save_path=None):
+    """
+    Сравнение F1-мер двух моделей для каждой эмоции
+    
+    Args:
+        f1_scores_lstm: F1-мера LSTM модели по классам
+        f1_scores_bert: F1-мера BERT-lite модели по классам
+        class_names: названия классов
+        save_path: путь для сохранения графика
+    """
+    plt.figure(figsize=(12, 6))
+    
+    x = np.arange(len(class_names))
+    width = 0.35
+    
+    plt.bar(x - width/2, f1_scores_lstm, width, label='LSTM')
+    plt.bar(x + width/2, f1_scores_bert, width, label='BERT-lite')
+    
+    plt.title('F1 Scores Comparison by Emotion', fontsize=14)
+    plt.xlabel('Emotion', fontsize=12)
+    plt.ylabel('F1 Score', fontsize=12)
+    plt.xticks(x, class_names, rotation=45)
+    plt.legend(fontsize=12)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path)
+        plt.close()
+    else:
+        plt.show()
+
+def plot_data_size_comparison(data_sizes, lstm_f1_scores, bert_f1_scores, save_path=None):
+    """
+    Построение графика зависимости F1-меры от размера обучающей выборки
+    
+    Args:
+        data_sizes: размеры обучающей выборки (в процентах)
+        lstm_f1_scores: F1-меры LSTM модели для разных размеров выборки
+        bert_f1_scores: F1-меры BERT-lite модели для разных размеров выборки
+        save_path: путь для сохранения графика
+    """
+    plt.figure(figsize=(10, 6))
+    
+    plt.plot(data_sizes, lstm_f1_scores, 'o-', label='LSTM', linewidth=2)
+    plt.plot(data_sizes, bert_f1_scores, 's-', label='BERT-lite', linewidth=2)
+    
+    plt.title('F1 Score vs. Training Data Size', fontsize=14)
+    plt.xlabel('Training Data Size (%)', fontsize=12)
+    plt.ylabel('F1 Score (Macro)', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=12)
+    
+    # Добавление подписей значений
+    for i, (x, y1, y2) in enumerate(zip(data_sizes, lstm_f1_scores, bert_f1_scores)):
+        plt.text(x, y1 - 0.02, f'{y1:.3f}', ha='center', va='top', fontsize=10)
+        plt.text(x, y2 + 0.01, f'{y2:.3f}', ha='center', va='bottom', fontsize=10)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path)
+        plt.close()
+    else:
+        plt.show()
+
+if __name__ == "__main__":
+    # Пример использования (закомментирован)
+    pass
