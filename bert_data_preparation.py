@@ -1,149 +1,147 @@
-"""
-bert_data_preparation.py
-Модуль для підготовки даних для BERT-lite моделі
-"""
-
 import torch
-from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
 from transformers import BertTokenizer
 from sklearn.preprocessing import LabelEncoder
-import numpy as np
+from tqdm import tqdm
 
-def prepare_data_for_bert(train_df, val_df, test_df, tokenizer_name='bert-base-multilingual-cased', 
-                          max_length=128, batch_size=32):
-    """
-    Підготовка даних для BERT-lite моделі
+class TextDataset(Dataset):
+    """Датасет для работы с текстовыми данными для LSTM модели"""
     
-    Args:
-        train_df: DataFrame з навчальними даними
-        val_df: DataFrame з валідаційними даними
-        test_df: DataFrame з тестовими даними
-        tokenizer_name: Назва токенізатора BERT
-        max_length: Максимальна довжина послідовності
-        batch_size: Розмір батчу
+    def __init__(self, texts, labels, vocab, max_len=128):
+        self.texts = texts
+        self.labels = labels
+        self.vocab = vocab
+        self.max_len = max_len
         
-    Returns:
-        Кортеж з даталоадерами, словниками та кількістю класів
-    """
-    # Завантаження токенізатора
-    tokenizer = BertTokenizer.from_pretrained(tokenizer_name)
+    def __len__(self):
+        return len(self.texts)
     
-    # Кодування міток
-    label_encoder = LabelEncoder()
-    train_labels = label_encoder.fit_transform(train_df['emotion'])
-    val_labels = label_encoder.transform(val_df['emotion'])
-    test_labels = label_encoder.transform(test_df['emotion'])
-    
-    # Словники для перетворення індексів в мітки і навпаки
-    label2idx = {label: idx for idx, label in enumerate(label_encoder.classes_)}
-    idx2label = {idx: label for label, idx in label2idx.items()}
-    num_classes = len(label2idx)
-    
-    # Підготовка даних
-    train_dataloader = create_bert_dataloader(
-        train_df['text'].tolist(), 
-        train_labels, 
-        tokenizer, 
-        max_length, 
-        batch_size, 
-        is_training=True
-    )
-    
-    val_dataloader = create_bert_dataloader(
-        val_df['text'].tolist(), 
-        val_labels, 
-        tokenizer, 
-        max_length, 
-        batch_size, 
-        is_training=False
-    )
-    
-    test_dataloader = create_bert_dataloader(
-        test_df['text'].tolist(), 
-        test_labels, 
-        tokenizer, 
-        max_length, 
-        batch_size, 
-        is_training=False
-    )
-    
-    return train_dataloader, val_dataloader, test_dataloader, label2idx, idx2label, num_classes
+    def __getitem__(self, idx):
+        text = self.texts.iloc[idx] if hasattr(self.texts, 'iloc') else self.texts[idx]
+        label = self.labels.iloc[idx] if hasattr(self.labels, 'iloc') else self.labels[idx]
+        
+        # Токенизация и преобразование в индексы
+        tokens = text.split()  # Предполагается, что текст уже предобработан
+        tokens = tokens[:self.max_len]  # Обрезаем до максимальной длины
+        
+        # Преобразование токенов в индексы
+        indexes = [self.vocab.get(token, self.vocab["<UNK>"]) for token in tokens]
+        
+        # Дополнение последовательности до максимальной длины
+        padding_length = self.max_len - len(indexes)
+        if padding_length > 0:
+            indexes = indexes + [self.vocab["<PAD>"]] * padding_length
+        
+        return {
+            'text': torch.tensor(indexes, dtype=torch.long),
+            'length': torch.tensor(min(len(tokens), self.max_len), dtype=torch.long),
+            'label': torch.tensor(label, dtype=torch.long)
+        }
 
-def create_bert_dataloader(texts, labels, tokenizer, max_length, batch_size, is_training=True):
-    """
-    Створення даталоадера для BERT
+class BertDataset(Dataset):
+    """Датасет для работы с текстовыми данными для BERT модели"""
     
-    Args:
-        texts: Список текстів
-        labels: Список міток
-        tokenizer: Токенізатор BERT
-        max_length: Максимальна довжина послідовності
-        batch_size: Розмір батчу
-        is_training: Чи є це навчальний даталоадер
+    def __init__(self, texts, labels, tokenizer, max_len=128):
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_len = max_len
         
-    Returns:
-        Даталоадер для BERT
-    """
-    # Кодування текстів
-    input_ids = []
-    attention_masks = []
+    def __len__(self):
+        return len(self.texts)
     
-    for text in texts:
-        encoded_dict = tokenizer.encode_plus(
-            text,                     
-            add_special_tokens=True,  # Додавання [CLS] та [SEP]
-            max_length=max_length,    
-            padding='max_length',     
-            truncation=True,          
-            return_attention_mask=True, 
-            return_tensors='pt',      
+    def __getitem__(self, idx):
+        text = self.texts.iloc[idx] if hasattr(self.texts, 'iloc') else self.texts[idx]
+        label = self.labels.iloc[idx] if hasattr(self.labels, 'iloc') else self.labels[idx]
+        
+        # Токенизация BERT
+        encoding = self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt'
         )
         
-        input_ids.append(encoded_dict['input_ids'])
-        attention_masks.append(encoded_dict['attention_mask'])
-    
-    # Конвертація в тензори
-    input_ids = torch.cat(input_ids, dim=0)
-    attention_masks = torch.cat(attention_masks, dim=0)
-    labels = torch.tensor(labels)
-    
-    # Створення датасету
-    dataset = TensorDataset(input_ids, attention_masks, labels)
-    
-    # Створення даталоадера
-    if is_training:
-        sampler = RandomSampler(dataset)
-    else:
-        sampler = SequentialSampler(dataset)
-    
-    dataloader = DataLoader(
-        dataset,
-        sampler=sampler,
-        batch_size=batch_size
-    )
-    
-    return dataloader
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'label': torch.tensor(label, dtype=torch.long)
+        }
 
-def preprocess_for_bert(text, tokenizer, max_length=128):
+def build_vocab(texts, max_vocab_size=50000):
     """
-    Препроцесинг одного тексту для BERT-lite
+    Построение словаря для LSTM модели
+    """
+    # Счетчик всех слов в текстах
+    word_counts = {}
+    for text in tqdm(texts, desc="Building vocabulary"):
+        for word in text.split():
+            word_counts[word] = word_counts.get(word, 0) + 1
     
-    Args:
-        text: Вхідний текст
-        tokenizer: Токенізатор BERT
-        max_length: Максимальна довжина послідовності
-        
-    Returns:
-        Тензори з індексами токенів та маскою уваги
+    # Сортировка по частоте
+    sorted_words = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)
+    
+    # Создание словаря
+    vocab = {"<PAD>": 0, "<UNK>": 1}  # Специальные токены
+    for i, (word, _) in enumerate(sorted_words[:max_vocab_size-2]):
+        vocab[word] = i + 2  # +2 из-за <PAD> и <UNK>
+    
+    print(f"Vocabulary size: {len(vocab)}")
+    return vocab
+
+def prepare_data_for_lstm(X_train, X_val, X_test, y_train, y_val, y_test, batch_size=64, max_vocab_size=50000, max_len=128):
     """
-    encoded_dict = tokenizer.encode_plus(
-        text,
-        add_special_tokens=True,
-        max_length=max_length,
-        padding='max_length',
-        truncation=True,
-        return_attention_mask=True,
-        return_tensors='pt',
+    Подготовка данных для LSTM модели
+    """
+    # Построение словаря
+    vocab = build_vocab(X_train, max_vocab_size)
+    
+    # Создание датасетов
+    train_dataset = TextDataset(X_train, y_train, vocab, max_len)
+    val_dataset = TextDataset(X_val, y_val, vocab, max_len)
+    test_dataset = TextDataset(X_test, y_test, vocab, max_len)
+    
+    # Создание даталоадеров
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+    
+    return train_loader, val_loader, test_loader, vocab
+
+def prepare_data_for_bert(X_train, X_val, X_test, y_train, y_val, y_test, batch_size=32, max_len=128, model_name="bert-base-multilingual-cased"):
+    """
+    Подготовка данных для BERT модели
+    """
+    # Загрузка токенизатора
+    tokenizer = BertTokenizer.from_pretrained(model_name)
+    
+    # Создание датасетов
+    train_dataset = BertDataset(X_train, y_train, tokenizer, max_len)
+    val_dataset = BertDataset(X_val, y_val, tokenizer, max_len)
+    test_dataset = BertDataset(X_test, y_test, tokenizer, max_len)
+    
+    # Создание даталоадеров
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+    
+    return train_loader, val_loader, test_loader, tokenizer
+
+if __name__ == "__main__":
+    # Примеры использования (закомментированы)
+    """
+    # Пример подготовки данных для LSTM
+    train_loader, val_loader, test_loader, vocab = prepare_data_for_lstm(
+        X_train, X_val, X_test, y_train, y_val, y_test
     )
     
-    return encoded_dict['input_ids'], encoded_dict['attention_mask']
+    # Пример подготовки данных для BERT
+    train_loader, val_loader, test_loader, tokenizer = prepare_data_for_bert(
+        X_train, X_val, X_test, y_train, y_val, y_test
+    )
+    """
+    pass
