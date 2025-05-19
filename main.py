@@ -1,391 +1,473 @@
-"""
-main.py
-Основний файл для класифікації емоцій у тексті за допомогою LSTM та BERT-lite
-"""
-import os
-import warnings
-
-# Подавление предупреждений TensorFlow/CUDA
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Подавляет все сообщения TensorFlow
-warnings.filterwarnings('ignore')  # Подавляет прочие предупреждения Python
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from transformers import BertTokenizer
-import argparse
-import os
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
+import random
+import os
+from sklearn.metrics import confusion_matrix, f1_score
+from transformers import AdamW, get_linear_schedule_with_warmup
 
-# Определение устройства для вычислений
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Используемое устройство: {device}")
+# Импорт собственных модулей
+from preprocessing import prepare_data, create_datasets_with_different_sizes
+from bert_data_preparation import prepare_data_for_lstm, prepare_data_for_bert
+from lstm_model import create_lstm_model
+from bert_lite_model import create_bert_lite_model
+from training import (train_lstm_model, train_bert_model, test_model,
+                     plot_training_curves, plot_confusion_matrix,
+                     plot_f1_scores_by_emotion, compare_models_f1,
+                     plot_data_size_comparison)
 
-# Проверка доступности CUDA и версии
-if device.type == 'cuda':
-    print(f"CUDA доступен: {torch.cuda.is_available()}")
-    print(f"Количество устройств CUDA: {torch.cuda.device_count()}")
-    print(f"Текущее устройство CUDA: {torch.cuda.current_device()}")
-    print(f"Название устройства CUDA: {torch.cuda.get_device_name(0)}")
-else:
-    print("CUDA недоступен, используется CPU")
-
-# Імпортуємо наші модулі
-from preprocessing import load_and_preprocess_data
-from lstm_model import create_dataloaders_for_lstm, initialize_lstm_model, train_lstm_model, preprocess_for_lstm
-from bert_lite_model import create_bert_lite_model, prepare_data_for_bert, train_bert_lite_model, preprocess_for_bert
-from evaluation import (evaluate_model_detailed, plot_training_history, plot_confusion_matrix, plot_f1_per_class,
-                      plot_models_comparison, plot_data_size_comparison, save_model, predict_emotion)
-
-def main():
+def set_seed(seed_value=42):
     """
-    Основна функція для тренування та оцінки моделей класифікації емоцій
+    Установка seed для воспроизводимости результатов
+    
+    Args:
+        seed_value: значение seed
     """
-    # Парсинг аргументів командного рядка
-    parser = argparse.ArgumentParser(description='Класифікація емоцій у тексті')
-    parser.add_argument('--data_path', type=str, default='emotions_dataset.csv', help='Шлях до файлу з даними')
-    parser.add_argument('--train_lstm', action='store_true', help='Тренувати LSTM модель')
-    parser.add_argument('--train_bert', action='store_true', help='Тренувати BERT-lite модель')
-    parser.add_argument('--compare', action='store_true', help='Порівняти моделі')
-    parser.add_argument('--predict', type=str, default=None, help='Передбачити емоцію для вказаного тексту')
-    parser.add_argument('--save_dir', type=str, default='models', help='Директорія для збереження моделей')
-    args = parser.parse_args()
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    torch.cuda.manual_seed_all(seed_value)
+    os.environ['PYTHONHASHSEED'] = str(seed_value)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def run_lstm_experiments(X_train, X_val, X_test, y_train, y_val, y_test, label_mapping, output_dir):
+    """
+    Запуск экспериментов с LSTM моделью
     
-    # Створення директорії для збереження моделей
-    os.makedirs(args.save_dir, exist_ok=True)
+    Args:
+        X_train, X_val, X_test: тренировочные, валидационные и тестовые тексты
+        y_train, y_val, y_test: тренировочные, валидационные и тестовые метки
+        label_mapping: соответствие меток и классов
+        output_dir: директория для сохранения результатов
     
-    # Визначення пристрою для обчислень
+    Returns:
+        lstm_results: результаты экспериментов с LSTM
+    """
+    print("Preparing data for LSTM...")
+    train_loader, val_loader, test_loader, vocab = prepare_data_for_lstm(
+        X_train, X_val, X_test, y_train, y_val, y_test
+    )
+    
+    print("Creating LSTM model...")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Використовується пристрій: {device}")
+    print(f"Using device: {device}")
     
-    # Завантаження та препроцесинг даних
-    if args.train_lstm or args.train_bert or args.compare:
-        print("Завантаження та препроцесинг даних...")
-        train_df, val_df, test_df = load_and_preprocess_data(args.data_path)
+    lstm_model = create_lstm_model(
+        vocab_size=len(vocab),
+        embedding_dim=300,
+        hidden_dim=256,
+        output_dim=len(label_mapping),
+        n_layers=2,
+        bidirectional=True,
+        dropout=0.3,
+        pad_idx=vocab["<PAD>"]
+    )
     
-    # Тренування та оцінка LSTM моделі
-    if args.train_lstm:
-        print("Підготовка даних для LSTM...")
-        train_dataloader_lstm, val_dataloader_lstm, test_dataloader_lstm, \
-        word2idx, idx2word, label2idx, idx2label, vocab_size = create_dataloaders_for_lstm(
-            train_df, val_df, test_df
+    # Настройка оптимизатора и функции потерь
+    optimizer = optim.Adam(lstm_model.parameters(), lr=0.001)
+    criterion = nn.CrossEntropyLoss()
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+    
+    # Обучение модели
+    print("Training LSTM model...")
+    lstm_save_path = os.path.join(output_dir, 'lstm_model.pt')
+    lstm_history, lstm_model, lstm_training_time = train_lstm_model(
+        lstm_model, train_loader, val_loader, optimizer, criterion, 
+        n_epochs=30, device=device, scheduler=scheduler, 
+        patience=5, model_save_path=lstm_save_path
+    )
+    
+    # Построение графиков обучения
+    lstm_curves_path = os.path.join(output_dir, 'lstm_training_curves.png')
+    plot_training_curves(lstm_history, save_path=lstm_curves_path)
+    
+    # Тестирование модели
+    print("Testing LSTM model...")
+    lstm_acc, lstm_f1_macro, lstm_f1_weighted, lstm_precision, lstm_recall, lstm_conf_matrix, lstm_inference_time = test_model(
+        lstm_model, test_loader, criterion, device, model_type='lstm'
+    )
+    
+    # Построение матрицы ошибок
+    id_to_label = {v: k for k, v in label_mapping.items()}
+    class_names = [id_to_label[i] for i in range(len(id_to_label))]
+    
+    lstm_cm_path = os.path.join(output_dir, 'lstm_confusion_matrix.png')
+    plot_confusion_matrix(
+        lstm_conf_matrix, class_names, model_name='LSTM', 
+        normalize=True, save_path=lstm_cm_path
+    )
+    
+    # Построение графика метрик для каждой эмоции
+    lstm_metrics_path = os.path.join(output_dir, 'lstm_metrics_by_emotion.png')
+    plot_f1_scores_by_emotion(
+        lstm_precision, lstm_recall, lstm_f1_macro, class_names, 
+        model_name='LSTM', save_path=lstm_metrics_path
+    )
+    
+    # Сохранение результатов
+    lstm_results = {
+        'model': lstm_model,
+        'history': lstm_history,
+        'accuracy': lstm_acc,
+        'f1_macro': lstm_f1_macro,
+        'f1_weighted': lstm_f1_weighted,
+        'precision': lstm_precision,
+        'recall': lstm_recall,
+        'conf_matrix': lstm_conf_matrix,
+        'training_time': lstm_training_time,
+        'inference_time': lstm_inference_time
+    }
+    
+    return lstm_results
+
+def run_bert_experiments(X_train, X_val, X_test, y_train, y_val, y_test, label_mapping, output_dir):
+    """
+    Запуск экспериментов с BERT-lite моделью
+    
+    Args:
+        X_train, X_val, X_test: тренировочные, валидационные и тестовые тексты
+        y_train, y_val, y_test: тренировочные, валидационные и тестовые метки
+        label_mapping: соответствие меток и классов
+        output_dir: директория для сохранения результатов
+    
+    Returns:
+        bert_results: результаты экспериментов с BERT-lite
+    """
+    print("Preparing data for BERT-lite...")
+    train_loader, val_loader, test_loader, tokenizer = prepare_data_for_bert(
+        X_train, X_val, X_test, y_train, y_val, y_test, batch_size=32
+    )
+    
+    print("Creating BERT-lite model...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    bert_model = create_bert_lite_model(
+        num_classes=len(label_mapping),
+        hidden_size=512,
+        num_hidden_layers=6,
+        num_attention_heads=8,
+        intermediate_size=2048,
+        dropout=0.3,
+        pretrained_model_name="bert-base-multilingual-cased"
+    )
+    
+    # Настройка оптимизатора и функции потерь
+    no_decay = ['bias', 'LayerNorm.weight']
+    optimizer_grouped_parameters = [
+        {'params': [p for n, p in bert_model.named_parameters() if not any(nd in n for nd in no_decay)],
+         'weight_decay': 0.01},
+        {'params': [p for n, p in bert_model.named_parameters() if any(nd in n for nd in no_decay)],
+         'weight_decay': 0.0}
+    ]
+    optimizer = AdamW(optimizer_grouped_parameters, lr=2e-5)
+    criterion = nn.CrossEntropyLoss()
+    
+    # Создание планировщика скорости обучения с разогревом
+    total_steps = len(train_loader) * 10  # 10 эпох
+    warmup_steps = int(total_steps * 0.1)  # 10% от общего количества шагов
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+    )
+    
+    # Обучение модели
+    print("Training BERT-lite model...")
+    bert_save_path = os.path.join(output_dir, 'bert_lite_model.pt')
+    bert_history, bert_model, bert_training_time = train_bert_model(
+        bert_model, train_loader, val_loader, optimizer, criterion, 
+        n_epochs=10, device=device, scheduler=None, 
+        patience=3, model_save_path=bert_save_path
+    )
+    
+    # Построение графиков обучения
+    bert_curves_path = os.path.join(output_dir, 'bert_training_curves.png')
+    plot_training_curves(bert_history, save_path=bert_curves_path)
+    
+    # Тестирование модели
+    print("Testing BERT-lite model...")
+    bert_acc, bert_f1_macro, bert_f1_weighted, bert_precision, bert_recall, bert_conf_matrix, bert_inference_time = test_model(
+        bert_model, test_loader, criterion, device, model_type='bert'
+    )
+    
+    # Построение матрицы ошибок
+    id_to_label = {v: k for k, v in label_mapping.items()}
+    class_names = [id_to_label[i] for i in range(len(id_to_label))]
+    
+    bert_cm_path = os.path.join(output_dir, 'bert_confusion_matrix.png')
+    plot_confusion_matrix(
+        bert_conf_matrix, class_names, model_name='BERT-lite', 
+        normalize=True, save_path=bert_cm_path
+    )
+    
+    # Построение графика метрик для каждой эмоции
+    bert_metrics_path = os.path.join(output_dir, 'bert_metrics_by_emotion.png')
+    plot_f1_scores_by_emotion(
+        bert_precision, bert_recall, bert_f1_macro, class_names, 
+        model_name='BERT-lite', save_path=bert_metrics_path
+    )
+    
+    # Сохранение результатов
+    bert_results = {
+        'model': bert_model,
+        'history': bert_history,
+        'accuracy': bert_acc,
+        'f1_macro': bert_f1_macro,
+        'f1_weighted': bert_f1_weighted,
+        'precision': bert_precision,
+        'recall': bert_recall,
+        'conf_matrix': bert_conf_matrix,
+        'training_time': bert_training_time,
+        'inference_time': bert_inference_time
+    }
+    
+    return bert_results
+
+def compare_models(lstm_results, bert_results, label_mapping, output_dir):
+    """
+    Сравнение результатов экспериментов с LSTM и BERT-lite моделями
+    
+    Args:
+        lstm_results: результаты экспериментов с LSTM
+        bert_results: результаты экспериментов с BERT-lite
+        label_mapping: соответствие меток и классов
+        output_dir: директория для сохранения результатов
+    """
+    # Подготовка данных для сравнения
+    id_to_label = {v: k for k, v in label_mapping.items()}
+    class_names = [id_to_label[i] for i in range(len(id_to_label))]
+    
+    # Создание таблицы сравнения
+    comparison_data = {
+        'Метрика': ['Точность (Accuracy)', 'F1-мера (Macro)', 'F1-мера (Weighted)', 
+                   'Время обучения (сек)', 'Время инференса (мс/образец)'],
+        'LSTM': [lstm_results['accuracy'], lstm_results['f1_macro'], lstm_results['f1_weighted'],
+                lstm_results['training_time'], lstm_results['inference_time'] * 1000],
+        'BERT-lite': [bert_results['accuracy'], bert_results['f1_macro'], bert_results['f1_weighted'],
+                    bert_results['training_time'], bert_results['inference_time'] * 1000]
+    }
+    
+    comparison_df = pd.DataFrame(comparison_data)
+    print("\nModel Comparison:")
+    print(comparison_df.to_string(index=False))
+    
+    # Сохранение таблицы сравнения
+    comparison_path = os.path.join(output_dir, 'model_comparison.csv')
+    comparison_df.to_csv(comparison_path, index=False)
+    
+    # Сравнение F1-мер для каждой эмоции
+    comparison_path = os.path.join(output_dir, 'emotion_comparison.png')
+    compare_models_f1(
+        f1_scores_lstm=lstm_results['f1_macro'], 
+        f1_scores_bert=bert_results['f1_macro'],
+        class_names=class_names,
+        save_path=comparison_path
+    )
+    
+    # Дополнительное сравнение метрик для каждой эмоции
+    emotion_metrics = pd.DataFrame({
+        'Эмоция': class_names,
+        'LSTM_precision': lstm_results['precision'],
+        'LSTM_recall': lstm_results['recall'],
+        'LSTM_f1': lstm_results['f1_macro'],
+        'BERT_precision': bert_results['precision'],
+        'BERT_recall': bert_results['recall'],
+        'BERT_f1': bert_results['f1_macro']
+    })
+    
+    print("\nMetrics by Emotion:")
+    print(emotion_metrics.to_string(index=False))
+    
+    # Сохранение метрик для каждой эмоции
+    emotion_metrics_path = os.path.join(output_dir, 'emotion_metrics.csv')
+    emotion_metrics.to_csv(emotion_metrics_path, index=False)
+
+def run_data_size_experiments(X_train, X_val, X_test, y_train, y_val, y_test, label_mapping, output_dir):
+    """
+    Эксперименты с размером обучающей выборки
+    
+    Args:
+        X_train, X_val, X_test: тренировочные, валидационные и тестовые тексты
+        y_train, y_val, y_test: тренировочные, валидационные и тестовые метки
+        label_mapping: соответствие меток и классов
+        output_dir: директория для сохранения результатов
+    """
+    print("Running data size experiments...")
+    
+    # Создание подвыборок разного размера
+    data_sizes = [0.1, 0.25, 0.5, 0.75, 1.0]
+    datasets = create_datasets_with_different_sizes(X_train, y_train, sizes=data_sizes)
+    
+    lstm_f1_scores = []
+    bert_f1_scores = []
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    for size in data_sizes:
+        print(f"\nTraining with {size*100}% of data")
+        X_subset, y_subset = datasets[size]
+        
+        # LSTM
+        print("Preparing data for LSTM...")
+        train_loader_lstm, val_loader_lstm, test_loader_lstm, vocab = prepare_data_for_lstm(
+            X_subset, X_val, X_test, y_subset, y_val, y_test
         )
         
-        print("Ініціалізація LSTM моделі...")
-        lstm_model = initialize_lstm_model(
-            vocab_size=vocab_size,
+        print("Training LSTM model...")
+        lstm_model = create_lstm_model(
+            vocab_size=len(vocab),
             embedding_dim=300,
             hidden_dim=256,
-            output_dim=len(label2idx),
+            output_dim=len(label_mapping),
             n_layers=2,
             bidirectional=True,
-            dropout=0.3
+            dropout=0.3,
+            pad_idx=vocab["<PAD>"]
         )
         
-        print("Тренування LSTM моделі...")
         optimizer = optim.Adam(lstm_model.parameters(), lr=0.001)
         criterion = nn.CrossEntropyLoss()
         
-        lstm_model, lstm_history = train_lstm_model(
-            lstm_model, train_dataloader_lstm, val_dataloader_lstm,
-            optimizer, criterion, 20, 5, device
+        lstm_save_path = os.path.join(output_dir, f'lstm_model_{int(size*100)}pct.pt')
+        _, lstm_model, _ = train_lstm_model(
+            lstm_model, train_loader_lstm, val_loader_lstm, optimizer, criterion, 
+            n_epochs=20, device=device, scheduler=None, 
+            patience=3, model_save_path=lstm_save_path
         )
         
-        # Візуалізація історії навчання
-        plot_training_history(lstm_history, 'Історія навчання LSTM')
+        # Тестирование LSTM модели
+        _, lstm_f1, _, _, _, _, _ = test_model(
+            lstm_model, test_loader_lstm, criterion, device, model_type='lstm'
+        )
+        lstm_f1_scores.append(lstm_f1)
         
-        # Оцінка LSTM моделі
-        print("Оцінка LSTM моделі...")
-        lstm_metrics = evaluate_model_detailed(
-            lstm_model, test_dataloader_lstm, idx2label, device, 'lstm'
+        # BERT-lite
+        print("Preparing data for BERT-lite...")
+        train_loader_bert, val_loader_bert, test_loader_bert, tokenizer = prepare_data_for_bert(
+            X_subset, X_val, X_test, y_subset, y_val, y_test, batch_size=32
         )
         
-        print("\nРезультати для LSTM:")
-        print(f"Accuracy: {lstm_metrics['accuracy']:.4f}")
-        print(f"Precision: {lstm_metrics['precision']:.4f}")
-        print(f"Recall: {lstm_metrics['recall']:.4f}")
-        print(f"F1-score: {lstm_metrics['f1']:.4f}")
-        print(f"Час інференсу: {lstm_metrics['inference_time']:.2f} мс/зразок")
-        
-        # Візуалізація матриці помилок
-        plot_confusion_matrix(
-            lstm_metrics['y_true'], lstm_metrics['y_pred'],
-            list(idx2label.values()), 'Матриця помилок LSTM'
+        print("Training BERT-lite model...")
+        bert_model = create_bert_lite_model(
+            num_classes=len(label_mapping),
+            hidden_size=512,
+            num_hidden_layers=6,
+            num_attention_heads=8,
+            intermediate_size=2048,
+            dropout=0.3,
+            pretrained_model_name="bert-base-multilingual-cased"
         )
         
-        # Візуалізація F1-міри для кожного класу
-        plot_f1_per_class(
-            lstm_metrics['y_true'], lstm_metrics['y_pred'],
-            list(idx2label.values()), 'F1-міра за класами (LSTM)'
-        )
-        
-        # Збереження LSTM моделі
-        lstm_metadata = {
-            'vocab_size': vocab_size,
-            'embedding_dim': lstm_model.embedding.embedding_dim,
-            'hidden_dim': lstm_model.lstm.hidden_size,
-            'output_dim': lstm_model.fc2.out_features,
-            'n_layers': lstm_model.lstm.num_layers,
-            'bidirectional': lstm_model.lstm.bidirectional,
-            'dropout': lstm_model.dropout.p,
-            'pad_idx': 0,
-            'label2idx': label2idx,
-            'idx2label': idx2label,
-            'word2idx': word2idx,
-            'metrics': {
-                'accuracy': lstm_metrics['accuracy'],
-                'precision': lstm_metrics['precision'],
-                'recall': lstm_metrics['recall'],
-                'f1': lstm_metrics['f1'],
-                'inference_time': lstm_metrics['inference_time']
-            }
-        }
-        
-        save_model(
-            lstm_model, f'{args.save_dir}/lstm_emotion_model.pt',
-            f'{args.save_dir}/lstm_emotion_config.json', lstm_metadata
-        )
-    
-    # Тренування та оцінка BERT-lite моделі
-    if args.train_bert:
-        print("Підготовка даних для BERT-lite...")
-        tokenizer = BertTokenizer.from_pretrained('bert-base-multilingual-cased')
-        
-        train_dataloader_bert, val_dataloader_bert, test_dataloader_bert, \
-        label2idx_bert, idx2label_bert, num_classes = prepare_data_for_bert(
-            train_df, val_df, test_df, tokenizer
-        )
-        
-        print("Ініціалізація BERT-lite моделі...")
-        bert_model = create_bert_lite_model(num_classes, device=device)
-        
-        print("Тренування BERT-lite моделі...")
-        optimizer = optim.AdamW(bert_model.parameters(), lr=2e-5)
+        no_decay = ['bias', 'LayerNorm.weight']
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in bert_model.named_parameters() if not any(nd in n for nd in no_decay)],
+             'weight_decay': 0.01},
+            {'params': [p for n, p in bert_model.named_parameters() if any(nd in n for nd in no_decay)],
+             'weight_decay': 0.0}
+        ]
+        optimizer = AdamW(optimizer_grouped_parameters, lr=2e-5)
         criterion = nn.CrossEntropyLoss()
         
-        bert_model, bert_history = train_bert_lite_model(
-            bert_model, train_dataloader_bert, val_dataloader_bert,
-            optimizer, criterion, 10, 3, device
+        bert_save_path = os.path.join(output_dir, f'bert_model_{int(size*100)}pct.pt')
+        _, bert_model, _ = train_bert_model(
+            bert_model, train_loader_bert, val_loader_bert, optimizer, criterion, 
+            n_epochs=6, device=device, scheduler=None, 
+            patience=2, model_save_path=bert_save_path
         )
         
-        # Візуалізація історії навчання
-        plot_training_history(bert_history, 'Історія навчання BERT-lite')
-        
-        # Оцінка BERT-lite моделі
-        print("Оцінка BERT-lite моделі...")
-        bert_metrics = evaluate_model_detailed(
-            bert_model, test_dataloader_bert, idx2label_bert, device, 'bert'
+        # Тестирование BERT модели
+        _, bert_f1, _, _, _, _, _ = test_model(
+            bert_model, test_loader_bert, criterion, device, model_type='bert'
         )
-        
-        print("\nРезультати для BERT-lite:")
-        print(f"Accuracy: {bert_metrics['accuracy']:.4f}")
-        print(f"Precision: {bert_metrics['precision']:.4f}")
-        print(f"Recall: {bert_metrics['recall']:.4f}")
-        print(f"F1-score: {bert_metrics['f1']:.4f}")
-        print(f"Час інференсу: {bert_metrics['inference_time']:.2f} мс/зразок")
-        
-        # Візуалізація матриці помилок
-        plot_confusion_matrix(
-            bert_metrics['y_true'], bert_metrics['y_pred'],
-            list(idx2label_bert.values()), 'Матриця помилок BERT-lite'
-        )
-        
-        # Візуалізація F1-міри для кожного класу
-        plot_f1_per_class(
-            bert_metrics['y_true'], bert_metrics['y_pred'],
-            list(idx2label_bert.values()), 'F1-міра за класами (BERT-lite)'
-        )
-        
-        # Збереження BERT-lite моделі
-        bert_metadata = {
-            'num_classes': bert_model.classifier.out_features,
-            'hidden_size': bert_model.config.hidden_size,
-            'num_hidden_layers': bert_model.config.num_hidden_layers,
-            'num_attention_heads': bert_model.config.num_attention_heads,
-            'intermediate_size': bert_model.config.intermediate_size,
-            'dropout': bert_model.dropout.p,
-            'label2idx': label2idx_bert,
-            'idx2label': idx2label_bert,
-            'tokenizer': 'bert-base-multilingual-cased',
-            'metrics': {
-                'accuracy': bert_metrics['accuracy'],
-                'precision': bert_metrics['precision'],
-                'recall': bert_metrics['recall'],
-                'f1': bert_metrics['f1'],
-                'inference_time': bert_metrics['inference_time']
-            }
-        }
-        
-        save_model(
-            bert_model, f'{args.save_dir}/bert_emotion_model.pt',
-            f'{args.save_dir}/bert_emotion_config.json', bert_metadata
-        )
+        bert_f1_scores.append(bert_f1)
     
-    # Порівняння моделей
-    if args.compare and args.train_lstm and args.train_bert:
-        print("\nПорівняння моделей:")
-        
-        # Порівняння загальних метрик
-        plot_models_comparison(
-            lstm_metrics, bert_metrics, 'general',
-            title='Порівняння загальних метрик'
-        )
-        
-        # Порівняння F1-міри за класами
-        f1_per_class_lstm = [lstm_metrics['f1_per_class'][label] for label in idx2label.values()]
-        f1_per_class_bert = [bert_metrics['f1_per_class'][label] for label in idx2label_bert.values()]
-        
-        plot_models_comparison(
-            f1_per_class_lstm, f1_per_class_bert, 'f1_per_class',
-            list(idx2label.values()), 'Порівняння F1-міри за класами'
-        )
-        
-        # Порівняння на різних обсягах даних
-        print("\nПорівняння моделей на різних обсягах даних...")
-        
-        from evaluation import compare_models_on_different_data_sizes
-        
-        results = compare_models_on_different_data_sizes(
-            lstm_model, bert_model, 
-            train_dataloader_lstm.dataset, val_dataloader_lstm, test_dataloader_lstm,
-            [0.1, 0.25, 0.5, 0.75, 1.0],
-            device
-        )
-        
-        # Візуалізація результатів
-        plot_data_size_comparison(
-            results['data_sizes'], results['lstm_f1s'], results['bert_f1s'],
-            'Залежність F1-міри від обсягу даних'
-        )
+    # Построение графика зависимости F1-меры от размера обучающей выборки
+    data_sizes_pct = [size * 100 for size in data_sizes]  # Convert to percentages
+    data_size_path = os.path.join(output_dir, 'data_size_comparison.png')
+    plot_data_size_comparison(
+        data_sizes_pct, lstm_f1_scores, bert_f1_scores, save_path=data_size_path
+    )
     
-    # Передбачення емоції для вказаного тексту
-    if args.predict:
-        from evaluation import load_lstm_model, load_bert_model
-        
-        print(f"\nПередбачення емоції для тексту: {args.predict}")
-        
-        # Завантаження LSTM моделі
-        if os.path.exists(f'{args.save_dir}/lstm_emotion_model.pt'):
-            lstm_model, lstm_config = load_lstm_model(
-                f'{args.save_dir}/lstm_emotion_model.pt',
-                f'{args.save_dir}/lstm_emotion_config.json',
-                device
-            )
-            
-            # Передбачення емоції за допомогою LSTM
-            word2idx = lstm_config['word2idx']
-            idx2label = lstm_config['idx2label']
-            
-            lstm_preproc = lambda text: preprocess_for_lstm(text, word2idx)
-            emotion_lstm, prob_lstm, _ = predict_emotion(args.predict, lstm_model, lstm_preproc, idx2label, device)
-            
-            print(f"LSTM: {emotion_lstm} (ймовірність: {prob_lstm:.4f})")
-        
-        # Завантаження BERT-lite моделі
-        if os.path.exists(f'{args.save_dir}/bert_emotion_model.pt'):
-            bert_model, bert_config = load_bert_model(
-                f'{args.save_dir}/bert_emotion_model.pt',
-                f'{args.save_dir}/bert_emotion_config.json',
-                device
-            )
-            
-            # Передбачення емоції за допомогою BERT-lite
-            idx2label_bert = bert_config['idx2label']
-            tokenizer = BertTokenizer.from_pretrained(bert_config['tokenizer'])
-            
-            bert_preproc = lambda text: preprocess_for_bert(text, tokenizer)
-            emotion_bert, prob_bert, _ = predict_emotion(args.predict, bert_model, bert_preproc, idx2label_bert, device)
-            
-            print(f"BERT-lite: {emotion_bert} (ймовірність: {prob_bert:.4f})")
+    # Сохранение результатов в CSV
+    data_size_results = pd.DataFrame({
+        'Data_Size_Pct': data_sizes_pct,
+        'LSTM_F1': lstm_f1_scores,
+        'BERT_F1': bert_f1_scores
+    })
+    
+    data_size_csv_path = os.path.join(output_dir, 'data_size_results.csv')
+    data_size_results.to_csv(data_size_csv_path, index=False)
+    
+    print("\nData Size Experiment Results:")
+    print(data_size_results.to_string(index=False))
 
-def interactive_mode():
+def main():
     """
-    Інтерактивний режим для класифікації емоцій
+    Основная функция для запуска экспериментов
     """
-    from evaluation import load_lstm_model, load_bert_model
+    # Установка seed для воспроизводимости
+    set_seed(42)
     
-    # Визначення пристрою для обчислень
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Создание директории для результатов
+    output_dir = 'results'
+    os.makedirs(output_dir, exist_ok=True)
     
-    # Завантаження моделей
-    models = {}
+    # Загрузка и подготовка данных
+    print("Loading and preparing data...")
+    # В реальной курсовой нужно заменить на загрузку реальных данных
+    # Здесь используем синтетические данные для иллюстрации
     
-    # Завантаження LSTM моделі
-    if os.path.exists('models/lstm_emotion_model.pt'):
-        print("Завантаження LSTM моделі...")
-        lstm_model, lstm_config = load_lstm_model(
-            'models/lstm_emotion_model.pt',
-            'models/lstm_emotion_config.json',
-            device
-        )
-        
-        word2idx = lstm_config['word2idx']
-        idx2label = lstm_config['idx2label']
-        
-        models['lstm'] = {
-            'model': lstm_model,
-            'preproc': lambda text: preprocess_for_lstm(text, word2idx),
-            'idx2label': idx2label
-        }
+    # Создание синтетического датасета
+    import pandas as pd
+    import numpy as np
     
-    # Завантаження BERT-lite моделі
-    if os.path.exists('models/bert_emotion_model.pt'):
-        print("Завантаження BERT-lite моделі...")
-        bert_model, bert_config = load_bert_model(
-            'models/bert_emotion_model.pt',
-            'models/bert_emotion_config.json',
-            device
-        )
-        
-        idx2label_bert = bert_config['idx2label']
-        tokenizer = BertTokenizer.from_pretrained(bert_config['tokenizer'])
-        
-        models['bert'] = {
-            'model': bert_model,
-            'preproc': lambda text: preprocess_for_bert(text, tokenizer),
-            'idx2label': idx2label_bert
-        }
+    # Функция для генерации случайного украинского текста
+    def generate_random_ukrainian_text(length=50):
+        ukr_alphabet = "абвгґдеєжзиіїйклмнопрстуфхцчшщьюя"
+        return ' '.join(''.join(random.choice(ukr_alphabet) for _ in range(random.randint(3, 10)))
+                       for _ in range(length))
     
-    if not models:
-        print("Не знайдено жодної моделі. Будь ласка, спочатку тренуйте моделі.")
-        return
+    # Создание синтетического датасета
+    n_samples = 10000  # Небольшой датасет для демонстрации
     
-    print("\n=== Інтерактивний режим класифікації емоцій ===")
-    print("Введіть текст для аналізу або 'exit' для виходу")
+    emotions = ["радість", "смуток", "гнів", "страх", "відраза", "здивування", "нейтральний"]
+    df = pd.DataFrame({
+        'text': [generate_random_ukrainian_text() for _ in range(n_samples)],
+        'emotion': [random.choice(emotions) for _ in range(n_samples)]
+    })
     
-    while True:
-        text = input("\nВведіть текст: ")
-        
-        if text.lower() == 'exit':
-            break
-        
-        print(f"Аналіз тексту: {text}")
-        
-        # Аналіз кожною моделлю
-        for model_name, model_data in models.items():
-            emotion, probability, _ = predict_emotion(
-                text, model_data['model'], model_data['preproc'], model_data['idx2label'], device
-            )
-            
-            print(f"{model_name.upper()}: {emotion} (ймовірність: {probability:.4f})")
+    # Сохранение синтетического датасета
+    df.to_csv(os.path.join(output_dir, 'synthetic_dataset.csv'), index=False)
+    
+    # Подготовка данных
+    X_train, X_val, X_test, y_train, y_val, y_test, label_mapping = prepare_data(
+        os.path.join(output_dir, 'synthetic_dataset.csv')
+    )
+    
+    # Запуск экспериментов с LSTM
+    lstm_results = run_lstm_experiments(
+        X_train, X_val, X_test, y_train, y_val, y_test, label_mapping, output_dir
+    )
+    
+    # Запуск экспериментов с BERT-lite
+    bert_results = run_bert_experiments(
+        X_train, X_val, X_test, y_train, y_val, y_test, label_mapping, output_dir
+    )
+    
+    # Сравнение моделей
+    compare_models(lstm_results, bert_results, label_mapping, output_dir)
+    
+    # Запуск экспериментов с размером обучающей выборки
+    run_data_size_experiments(
+        X_train, X_val, X_test, y_train, y_val, y_test, label_mapping, output_dir
+    )
+    
+    print("\nAll experiments completed successfully!")
+    print(f"Results saved to directory: {output_dir}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Класифікація емоцій у тексті')
-    parser.add_argument('--interactive', action='store_true', help='Запустити в інтерактивному режимі')
-    args, unknown = parser.parse_known_args()
-    
-    if args.interactive:
-        interactive_mode()
-    else:
-        main()
-
-print("Начало загрузки данных...")
-# Загрузка данных
-print("Данные загружены")
-
-print("Начало создания модели...")
-# Создание модели
-print("Модель создана")
-
-print("Начало обучения...")
-# Обучение
-print("Обучение завершено")
+    main()
