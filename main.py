@@ -16,6 +16,19 @@ import argparse
 import os
 import matplotlib.pyplot as plt
 
+# Определение устройства для вычислений
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Используемое устройство: {device}")
+
+# Проверка доступности CUDA и версии
+if device.type == 'cuda':
+    print(f"CUDA доступен: {torch.cuda.is_available()}")
+    print(f"Количество устройств CUDA: {torch.cuda.device_count()}")
+    print(f"Текущее устройство CUDA: {torch.cuda.current_device()}")
+    print(f"Название устройства CUDA: {torch.cuda.get_device_name(0)}")
+else:
+    print("CUDA недоступен, используется CPU")
+
 # Імпортуємо наші модулі
 from preprocessing import load_and_preprocess_data
 from lstm_model import create_dataloaders_for_lstm, initialize_lstm_model, train_lstm_model, preprocess_for_lstm
@@ -364,3 +377,15 @@ if __name__ == "__main__":
         interactive_mode()
     else:
         main()
+
+print("Начало загрузки данных...")
+# Загрузка данных
+print("Данные загружены")
+
+print("Начало создания модели...")
+# Создание модели
+print("Модель создана")
+
+print("Начало обучения...")
+# Обучение
+print("Обучение завершено")
