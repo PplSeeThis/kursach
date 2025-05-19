@@ -1,221 +1,220 @@
-"""
-preprocessing.py
-Модуль для препроцесингу тексту для класифікації емоцій
-"""
-
 import re
 import pandas as pd
-import nltk
-from nltk.corpus import stopwords
-from nltk.stem import WordNetLemmatizer
-from sklearn.model_selection import train_test_split
-import random
 import numpy as np
-import torch
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import Counter
+import nltk
+from tqdm import tqdm
 
-# Налаштування відтворюваності
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(SEED)
-    torch.backends.cudnn.deterministic = True
-
-# Завантаження стоп-слів та лематизатора
-nltk.download('stopwords')
-nltk.download('wordnet')
-
-# Створення списку українських стоп-слів
+# Загрузка необходимых моделей NLTK
 try:
-    stop_words = set(stopwords.words('ukrainian'))
-except OSError:
-    # Если стоп-слова недоступны, используем наш собственный список
-    from ukrainian_stopwords import UKRAINIAN_STOPWORDS
-    stop_words = set(UKRAINIAN_STOPWORDS)
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
+
+# Список стоп-слов для украинского языка
+STOP_WORDS = set(stopwords.words('ukrainian'))
+
+# Словарь для замены эмотиконов
+EMOTICONS = {
+    ':)': 'радість',
+    ':(': 'смуток',
+    ':D': 'радість',
+    ':-D': 'радість',
+    ':-(': 'смуток',
+    ':-)': 'радість',
+    ';)': 'радість',
+    ':-P': 'радість',
+    ':P': 'радість',
+    ':/': 'розчарування',
+    ':-/': 'розчарування',
+    ':|': 'нейтральний',
+    ':-|': 'нейтральний',
+    ':O': 'здивування',
+    ':-O': 'здивування',
+    ':(': 'смуток',
+    ':-(': 'смуток',
+    '>:(': 'гнів',
+    '>:-(': 'гнів',
+    ':\'(': 'смуток',
+    '♥': 'радість',
+    '❤': 'радість',
+}
 
 def normalize_text(text):
     """
-    Нормалізація тексту: приведення до нижнього регістру, 
-    заміна емотиконів, видалення URL, HTML-тегів, спеціальних символів
-    
-    Args:
-        text: Текст для нормалізації
-        
-    Returns:
-        Нормалізований текст
+    Нормализация текста:
+    - приведение к нижнему регистру
+    - замена эмотиконов
+    - удаление URL, HTML тегов, специальных символов, лишних пробелов
     """
-    # Перевірка на None або порожній рядок
-    if text is None or text == '':
-        return ''
+    if not isinstance(text, str):
+        return ""
     
-    # Приведення до нижнього регістру
+    # Приведение к нижнему регистру
     text = text.lower()
     
-    # Заміна емотиконів на текстові мітки
-    text = re.sub(r':\)', ' емоція_радість ', text)
-    text = re.sub(r':\(', ' емоція_смуток ', text)
-    text = re.sub(r':D', ' емоція_радість ', text)
-    text = re.sub(r':\|', ' емоція_нейтральний ', text)
+    # Замена эмотиконов
+    for emoticon, replacement in EMOTICONS.items():
+        text = text.replace(emoticon, f" {replacement} ")
     
-    # Видалення URL
-    text = re.sub(r'https?://\S+|www\.\S+', '', text)
+    # Удаление URL
+    text = re.sub(r'https?://\S+|www\.\S+', ' ', text)
     
-    # Видалення HTML-тегів
-    text = re.sub(r'<.*?>', '', text)
+    # Удаление HTML тегов
+    text = re.sub(r'<.*?>', ' ', text)
     
-    # Видалення спеціальних символів та цифр
-    text = re.sub(r'[^\w\s]', ' ', text)
-    text = re.sub(r'\d+', ' ', text)
+    # Удаление специальных символов (оставляем только буквы, цифры и базовую пунктуацию)
+    text = re.sub(r'[^\w\s\.,!?;:\(\)-]', ' ', text)
     
-    # Видалення зайвих пробілів
+    # Удаление лишних пробелов
     text = re.sub(r'\s+', ' ', text).strip()
     
     return text
 
-def tokenize_and_remove_stopwords(text):
+def tokenize_text(text):
     """
-    Токенізація тексту та видалення стоп-слів
-    
-    Args:
-        text: Текст для обробки
-        
-    Returns:
-        Список токенів без стоп-слів
+    Токенизация текста с помощью NLTK
     """
-    # Токенізація
-    tokens = text.split()
-    
-    # Видалення стоп-слів
-    tokens = [token for token in tokens if token not in stop_words]
-    
-    return tokens
+    return word_tokenize(text, language='ukrainian')
+
+def remove_stopwords(tokens):
+    """
+    Удаление стоп-слов из токенизированного текста
+    """
+    return [token for token in tokens if token.lower() not in STOP_WORDS]
 
 def lemmatize_text(tokens):
     """
-    Лематизація токенів
-    
-    Args:
-        tokens: Список токенів
-        
-    Returns:
-        Текст з лематизованими токенами
+    Заглушка для лемматизации украинского текста.
+    В реальном проекте здесь следует использовать специализированный лемматизатор для украинского языка.
     """
-    lemmatizer = WordNetLemmatizer()
-    lemmatized_tokens = [lemmatizer.lemmatize(token) for token in tokens]
-    return ' '.join(lemmatized_tokens)
+    # В данной реализации просто возвращаем исходные токены
+    # В реальном проекте можно использовать, например, pymorphy2 с украинским словарем
+    return tokens
 
 def preprocess_text(text):
     """
-    Повний процес препроцесингу тексту
-    
-    Args:
-        text: Текст для обробки
-        
-    Returns:
-        Оброблений текст
+    Полный пайплайн предобработки текста
     """
-    # Нормалізація тексту
-    normalized_text = normalize_text(text)
-    
-    # Токенізація та видалення стоп-слів
-    tokens = tokenize_and_remove_stopwords(normalized_text)
-    
-    # Лематизація
-    lemmatized_text = lemmatize_text(tokens)
-    
-    return lemmatized_text
+    text = normalize_text(text)
+    tokens = tokenize_text(text)
+    tokens = remove_stopwords(tokens)
+    tokens = lemmatize_text(tokens)
+    return ' '.join(tokens)
 
-def load_and_preprocess_data(file_path):
+def prepare_data(data_path, random_state=42):
     """
-    Завантаження та препроцесинг даних
-    
-    Args:
-        file_path: Шлях до CSV файлу з даними
-        
-    Returns:
-        Кортеж з трьома DataFrame: train_df, val_df, test_df
+    Загрузка и подготовка данных из CSV файла:
+    - предобработка текста
+    - разделение на тренировочную, валидационную и тестовую выборки
     """
-    # Завантаження даних
-    df = pd.read_csv(file_path)
+    # Загрузка данных
+    df = pd.read_csv(data_path)
     
-    # Перевірка наявності необхідних стовпців
-    if 'text' not in df.columns or 'emotion' not in df.columns:
-        raise ValueError("CSV файл повинен містити стовпці 'text' та 'emotion'")
+    # Предобработка текста
+    tqdm.pandas(desc="Preprocessing texts")
+    df['processed_text'] = df['text'].progress_apply(preprocess_text)
     
-    # Препроцесинг тексту
-    df['processed_text'] = df['text'].apply(preprocess_text)
+    # Определение меток классов
+    label_mapping = {
+        'радість': 0,
+        'смуток': 1,
+        'гнів': 2,
+        'страх': 3,
+        'відраза': 4,
+        'здивування': 5,
+        'нейтральний': 6
+    }
+    df['label_id'] = df['emotion'].map(label_mapping)
     
-    # Розподіл на навчальну, валідаційну та тестову вибірки
-    train_df, temp_df = train_test_split(df, test_size=0.3, stratify=df['emotion'], random_state=SEED)
-    val_df, test_df = train_test_split(temp_df, test_size=0.5, stratify=temp_df['emotion'], random_state=SEED)
+    # Разделение на тренировочную, валидационную и тестовую выборки
+    X = df['processed_text']
+    y = df['label_id']
     
-    print(f"Розмір навчальної вибірки: {len(train_df)}")
-    print(f"Розмір валідаційної вибірки: {len(val_df)}")
-    print(f"Розмір тестової вибірки: {len(test_df)}")
+    # Сначала разделяем на train и temporary (тест + валидация)
+    X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, random_state=random_state, stratify=y)
     
-    return train_df, val_df, test_df
+    # Затем разделяем temporary на validation и test (по 15% каждый)
+    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=random_state, stratify=y_temp)
+    
+    # Проверка распределения классов
+    print("Train set class distribution:")
+    print(y_train.value_counts().sort_index())
+    print("\nValidation set class distribution:")
+    print(y_val.value_counts().sort_index())
+    print("\nTest set class distribution:")
+    print(y_test.value_counts().sort_index())
+    
+    return X_train, X_val, X_test, y_train, y_val, y_test, label_mapping
 
-class VocabBuilder:
+def plot_class_distribution(y_train, y_val, y_test, label_mapping, save_path=None):
     """
-    Клас для побудови словника з текстових даних
+    Построение графика распределения классов в наборах данных
     """
-    def __init__(self, min_freq=2):
-        """
-        Ініціалізація побудовника словника
-        
-        Args:
-            min_freq: Мінімальна частота слова для включення в словник
-        """
-        self.word2idx = {'<pad>': 0, '<unk>': 1}
-        self.idx2word = {0: '<pad>', 1: '<unk>'}
-        self.frequencies = {}
-        self.min_freq = min_freq
-        
-    def add_word(self, word):
-        """
-        Додавання слова до словника та підрахунок частоти
-        
-        Args:
-            word: Слово для додавання
-        """
-        if word not in self.frequencies:
-            self.frequencies[word] = 1
+    # Инвертирование label_mapping для получения имен классов
+    id_to_label = {v: k for k, v in label_mapping.items()}
+    
+    # Подсчет экземпляров каждого класса
+    train_counts = Counter(y_train)
+    val_counts = Counter(y_val)
+    test_counts = Counter(y_test)
+    
+    # Создание DataFrame для построения графика
+    df_counts = pd.DataFrame({
+        'Тренировочная выборка': [train_counts.get(i, 0) for i in range(len(id_to_label))],
+        'Валидационная выборка': [val_counts.get(i, 0) for i in range(len(id_to_label))],
+        'Тестовая выборка': [test_counts.get(i, 0) for i in range(len(id_to_label))]
+    }, index=[id_to_label[i] for i in range(len(id_to_label))])
+    
+    # Построение графика
+    plt.figure(figsize=(12, 8))
+    df_counts.plot(kind='bar', ax=plt.gca())
+    plt.title('Распределение классов в наборах данных', fontsize=14)
+    plt.xlabel('Эмоция', fontsize=12)
+    plt.ylabel('Количество экземпляров', fontsize=12)
+    plt.xticks(rotation=45)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path)
+        plt.close()
+    else:
+        plt.show()
+
+def create_datasets_with_different_sizes(X_train, y_train, sizes=[0.1, 0.25, 0.5, 0.75, 1.0], random_state=42):
+    """
+    Создание подвыборок разного размера из тренировочного набора данных
+    """
+    datasets = {}
+    
+    for size in sizes:
+        if size < 1.0:
+            X_subset, _, y_subset, _ = train_test_split(
+                X_train, y_train, 
+                train_size=size, 
+                random_state=random_state, 
+                stratify=y_train
+            )
         else:
-            self.frequencies[word] += 1
-            
-    def build_vocab(self):
-        """
-        Побудова словника на основі частоти слів
+            X_subset, y_subset = X_train, y_train
         
-        Returns:
-            Кортеж з двох словників: word2idx та idx2word
-        """
-        idx = 2  # Починаємо з 2 (0 і 1 зарезервовані для pad і unk)
-        for word, freq in self.frequencies.items():
-            if freq >= self.min_freq:
-                self.word2idx[word] = idx
-                self.idx2word[idx] = word
-                idx += 1
-        
-        return self.word2idx, self.idx2word
+        datasets[size] = (X_subset, y_subset)
+        print(f"Dataset with {size*100}% of training data created: {len(X_subset)} samples")
+    
+    return datasets
 
-def build_vocab(texts, min_freq=2):
-    """
-    Побудова словника з текстів
-    
-    Args:
-        texts: Список текстів
-        min_freq: Мінімальна частота слова для включення в словник
-        
-    Returns:
-        Словник відображення слів у індекси
-    """
-    vocab_builder = VocabBuilder(min_freq=min_freq)
-    
-    for text in texts:
-        for word in text.split():
-            vocab_builder.add_word(word)
-    
-    word2idx, _ = vocab_builder.build_vocab()
-    return word2idx
+if __name__ == "__main__":
+    # Пример использования (закомментирован, так как файла данных может не быть)
+    # X_train, X_val, X_test, y_train, y_val, y_test, label_mapping = prepare_data("emotion_dataset.csv")
+    # plot_class_distribution(y_train, y_val, y_test, label_mapping, "class_distribution.png")
+    pass
